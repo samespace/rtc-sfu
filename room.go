@@ -5,14 +5,21 @@ import (
 	"sync"
 	"time"
 
+	"github.com/inlivedev/sfu/pkg/recorder"
+	"github.com/pion/interceptor"
+	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 )
 
 const (
-	StateRoomOpen       = "open"
-	StateRoomClosed     = "closed"
-	EventRoomClosed     = "room_closed"
-	EventRoomClientLeft = "room_client_left"
+	StateRoomOpen        = "open"
+	StateRoomClosed      = "closed"
+	EventRoomClosed      = "room_closed"
+	EventRoomClientLeft  = "room_client_left"
+	EventRecordingStart  = "recording_start"
+	EventRecordingPause  = "recording_pause"
+	EventRecordingResume = "recording_resume"
+	EventRecordingStop   = "recording_stop"
 )
 
 type Options struct {
@@ -68,6 +75,10 @@ type Room struct {
 	extensions              []IExtension
 	OnEvent                 func(event Event)
 	options                 RoomOptions
+	// Recording related fields
+	recorder           *recorder.RoomRecorder
+	recordingConfigMgr *recorder.ConfigManager
+	isRecordingEnabled bool
 }
 
 type RoomOptions struct {
@@ -84,6 +95,20 @@ type RoomOptions struct {
 	QualityLevels []QualityLevel `json:"quality_levels,omitempty"`
 	// Configure the timeout in nanonseconds when the room is empty it will close after the timeout exceeded. Default is 5 minutes
 	EmptyRoomTimeout *time.Duration `json:"empty_room_timeout_ns,ompitempty" example:"300000000000" default:"300000000000"`
+	// Configure recording options for the room
+	Recording *RecordingOptions `json:"recording,omitempty"`
+}
+
+// RecordingOptions contains options for room recording
+type RecordingOptions struct {
+	// Whether recording is enabled for this room
+	Enabled bool `json:"enabled"`
+	// Path where recordings will be stored
+	RecordingsPath string `json:"recordings_path"`
+	// FFmpeg executable path (optional)
+	FFmpegPath string `json:"ffmpeg_path"`
+	// Auto-merge recordings when room closes
+	AutoMerge bool `json:"auto_merge"`
 }
 
 func DefaultRoomOptions() RoomOptions {
@@ -95,6 +120,12 @@ func DefaultRoomOptions() RoomOptions {
 		Codecs:           &[]string{webrtc.MimeTypeVP9, webrtc.MimeTypeH264, webrtc.MimeTypeVP8, "audio/red", webrtc.MimeTypeOpus},
 		PLIInterval:      &pli,
 		EmptyRoomTimeout: &emptyDuration,
+		Recording: &RecordingOptions{
+			Enabled:        false,
+			RecordingsPath: "recordings",
+			FFmpegPath:     "ffmpeg",
+			AutoMerge:      true,
+		},
 	}
 }
 
@@ -102,19 +133,50 @@ func newRoom(id, name string, sfu *SFU, kind string, opts RoomOptions) *Room {
 	localContext, cancel := context.WithCancel(sfu.context)
 
 	room := &Room{
-		id:         id,
-		context:    localContext,
-		cancel:     cancel,
-		sfu:        sfu,
-		token:      GenerateID(21),
-		stats:      make(map[string]*TrackStats),
-		state:      StateRoomOpen,
-		name:       name,
-		mu:         &sync.RWMutex{},
-		meta:       NewMetadata(),
-		extensions: make([]IExtension, 0),
-		kind:       kind,
-		options:    opts,
+		id:                 id,
+		context:            localContext,
+		cancel:             cancel,
+		sfu:                sfu,
+		token:              GenerateID(21),
+		stats:              make(map[string]*TrackStats),
+		state:              StateRoomOpen,
+		name:               name,
+		mu:                 &sync.RWMutex{},
+		meta:               NewMetadata(),
+		extensions:         make([]IExtension, 0),
+		kind:               kind,
+		options:            opts,
+		isRecordingEnabled: opts.Recording != nil && opts.Recording.Enabled,
+	}
+
+	// Initialize recording if enabled
+	if room.isRecordingEnabled && opts.Recording != nil {
+		// Create recorder config
+		room.recordingConfigMgr = recorder.NewConfigManager()
+		recordingConfig := room.recordingConfigMgr.GetConfig()
+		recordingConfig.RecordingsPath = opts.Recording.RecordingsPath
+		recordingConfig.FFmpegPath = opts.Recording.FFmpegPath
+		recordingConfig.AutoMerge = opts.Recording.AutoMerge
+		_ = room.recordingConfigMgr.UpdateConfig(recordingConfig)
+
+		// Initialize room recorder
+		rec, err := recorder.NewRoomRecorder(localContext, id, recordingConfig.RecordingsPath, recordingConfig.FFmpegPath)
+		if err != nil {
+			sfu.log.Errorf("room: failed to initialize recorder: %v", err)
+		} else {
+			room.recorder = rec
+			sfu.log.Infof("room: recording enabled for room %s", id)
+
+			if room.OnEvent != nil {
+				room.OnEvent(Event{
+					Type: EventRecordingStart,
+					Time: time.Now(),
+					Data: map[string]interface{}{
+						"room_id": id,
+					},
+				})
+			}
+		}
 	}
 
 	sfu.OnClientRemoved(func(client *Client) {
@@ -148,6 +210,25 @@ func (r *Room) AddExtension(extension IExtension) {
 func (r *Room) Close() error {
 	if r.state == StateRoomClosed {
 		return ErrRoomIsClosed
+	}
+
+	// Stop recording if enabled
+	if r.isRecordingEnabled && r.recorder != nil {
+		if err := r.recorder.StopRecording(); err != nil {
+			r.sfu.log.Errorf("room: failed to stop recording: %v", err)
+		} else {
+			r.sfu.log.Infof("room: recording stopped for room %s", r.id)
+
+			if r.OnEvent != nil {
+				r.OnEvent(Event{
+					Type: EventRecordingStop,
+					Time: time.Now(),
+					Data: map[string]interface{}{
+						"room_id": r.id,
+					},
+				})
+			}
+		}
 	}
 
 	r.cancel()
@@ -240,6 +321,47 @@ func (r *Room) AddClient(id, name string, opts ClientOptions) (*Client, error) {
 	client.OnJoined(func() {
 		r.onClientJoined(client)
 	})
+
+	// Set up recording for the client audio tracks if recording is enabled
+	if r.isRecordingEnabled && r.recorder != nil {
+		client.onTrack = func(track ITrack) {
+			if track.Kind() == webrtc.RTPCodecTypeAudio {
+				// Get the opus parameters from the track
+				sampleRate := uint32(48000) // Default for Opus
+				channelCount := uint16(1)   // Default for Opus
+
+				// Get these from the codec parameters if available
+				if track.MimeType() == webrtc.MimeTypeOpus {
+					codecParams := track.(*Track).base.codec
+					if codecParams.ClockRate > 0 {
+						sampleRate = uint32(codecParams.ClockRate)
+					}
+
+					// Handle channels correctly
+					if codecParams.SDPFmtpLine != "" {
+						// For Opus, channel count is typically in the codec parameters
+						// but alternatively we could use a fixed value of 1 (mono) or 2 (stereo)
+						// since we know it's an audio track
+						channelCount = 1 // Mono is typical for voice calls
+					}
+				}
+
+				// Add participant to recording
+				if err := r.recorder.AddParticipant(client.ID(), track.ID(), sampleRate, channelCount); err != nil {
+					r.sfu.log.Errorf("room: failed to add participant to recording: %v", err)
+					return
+				}
+
+				// Set up RTP packet interception for recording
+				track.OnRead(func(attrs interceptor.Attributes, packet *rtp.Packet, quality QualityLevel) {
+					if err := r.recorder.WriteRTP(client.ID(), packet); err != nil {
+						// Only log this at debug level to avoid flooding logs
+						r.sfu.log.Debugf("room: failed to write RTP packet: %v", err)
+					}
+				})
+			}
+		}
+	}
 
 	return client, nil
 }
@@ -429,4 +551,183 @@ func (r *Room) loopRecordStats() {
 			r.updateStats()
 		}
 	}
+}
+
+// StartRecording starts recording for the room
+func (r *Room) StartRecording() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.state == StateRoomClosed {
+		return ErrRoomIsClosed
+	}
+
+	if !r.isRecordingEnabled {
+		// Initialize recording config
+		r.recordingConfigMgr = recorder.NewConfigManager()
+		config := r.recordingConfigMgr.GetConfig()
+
+		// Use default options from room options if available
+		if r.options.Recording != nil {
+			config.RecordingsPath = r.options.Recording.RecordingsPath
+			config.FFmpegPath = r.options.Recording.FFmpegPath
+			config.AutoMerge = r.options.Recording.AutoMerge
+		}
+
+		_ = r.recordingConfigMgr.UpdateConfig(config)
+
+		// Create room recorder
+		rec, err := recorder.NewRoomRecorder(r.context, r.id, config.RecordingsPath, config.FFmpegPath)
+		if err != nil {
+			return err
+		}
+
+		r.recorder = rec
+		r.isRecordingEnabled = true
+
+		// Add all existing clients to the recorder
+		clients := r.sfu.GetClients()
+		for _, client := range clients {
+			for _, track := range client.Tracks() {
+				if track.Kind() == webrtc.RTPCodecTypeAudio {
+					// Get the opus parameters from the track
+					sampleRate := uint32(48000) // Default for Opus
+					channelCount := uint16(1)   // Default for Opus
+
+					// Get these from the codec parameters if available
+					if track.MimeType() == webrtc.MimeTypeOpus {
+						codecParams := track.(*Track).base.codec
+						if codecParams.ClockRate > 0 {
+							sampleRate = uint32(codecParams.ClockRate)
+						}
+
+						// Handle channels correctly
+						if codecParams.SDPFmtpLine != "" {
+							// For Opus, channel count is typically in the codec parameters
+							// but alternatively we could use a fixed value of 1 (mono) or 2 (stereo)
+							// since we know it's an audio track
+							channelCount = 1 // Mono is typical for voice calls
+						}
+					}
+
+					// Add participant to recording
+					if err := r.recorder.AddParticipant(client.ID(), track.ID(), sampleRate, channelCount); err != nil {
+						r.sfu.log.Errorf("room: failed to add participant to recording: %v", err)
+						continue
+					}
+
+					// Set up RTP packet interception for recording
+					track.OnRead(func(attrs interceptor.Attributes, packet *rtp.Packet, quality QualityLevel) {
+						if err := r.recorder.WriteRTP(client.ID(), packet); err != nil {
+							// Only log this at debug level to avoid flooding logs
+							r.sfu.log.Debugf("room: failed to write RTP packet: %v", err)
+						}
+					})
+				}
+			}
+		}
+
+		if r.OnEvent != nil {
+			r.OnEvent(Event{
+				Type: EventRecordingStart,
+				Time: time.Now(),
+				Data: map[string]interface{}{
+					"room_id": r.id,
+				},
+			})
+		}
+	} else if r.recorder != nil {
+		// Recording is already enabled, just resume if paused
+		if r.recorder.GetState() == recorder.RecordingStatePaused {
+			if err := r.recorder.ResumeRecording(); err != nil {
+				return err
+			}
+
+			if r.OnEvent != nil {
+				r.OnEvent(Event{
+					Type: EventRecordingResume,
+					Time: time.Now(),
+					Data: map[string]interface{}{
+						"room_id": r.id,
+					},
+				})
+			}
+		}
+	}
+
+	return nil
+}
+
+// PauseRecording pauses recording for the room
+func (r *Room) PauseRecording() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if !r.isRecordingEnabled || r.recorder == nil {
+		return nil // Nothing to pause
+	}
+
+	if err := r.recorder.PauseRecording(); err != nil {
+		return err
+	}
+
+	if r.OnEvent != nil {
+		r.OnEvent(Event{
+			Type: EventRecordingPause,
+			Time: time.Now(),
+			Data: map[string]interface{}{
+				"room_id": r.id,
+			},
+		})
+	}
+
+	return nil
+}
+
+// StopRecording stops recording for the room
+func (r *Room) StopRecording() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if !r.isRecordingEnabled || r.recorder == nil {
+		return nil // Nothing to stop
+	}
+
+	if err := r.recorder.StopRecording(); err != nil {
+		return err
+	}
+
+	r.isRecordingEnabled = false
+	r.recorder = nil
+
+	if r.OnEvent != nil {
+		r.OnEvent(Event{
+			Type: EventRecordingStop,
+			Time: time.Now(),
+			Data: map[string]interface{}{
+				"room_id": r.id,
+			},
+		})
+	}
+
+	return nil
+}
+
+// IsRecordingEnabled returns whether recording is enabled for the room
+func (r *Room) IsRecordingEnabled() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.isRecordingEnabled
+}
+
+// GetRecordingState returns the current state of recording
+func (r *Room) GetRecordingState() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if !r.isRecordingEnabled || r.recorder == nil {
+		return string(recorder.RecordingStateStopped)
+	}
+
+	return string(r.recorder.GetState())
 }
