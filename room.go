@@ -326,24 +326,31 @@ func (r *Room) AddClient(id, name string, opts ClientOptions) (*Client, error) {
 	if r.isRecordingEnabled && r.recorder != nil {
 		client.onTrack = func(track ITrack) {
 			if track.Kind() == webrtc.RTPCodecTypeAudio {
-				// Get the opus parameters from the track
+				// Use type switch to handle both Track and AudioTrack types
+				var codecParams webrtc.RTPCodecParameters
+				switch t := track.(type) {
+				case *Track:
+					codecParams = t.base.codec
+				case *AudioTrack:
+					codecParams = t.Track.base.codec
+				default:
+					r.sfu.log.Warnf("room: unknown track type: %T", track)
+					return
+				}
+
 				sampleRate := uint32(48000) // Default for Opus
 				channelCount := uint16(1)   // Default for Opus
 
-				// Get these from the codec parameters if available
-				if track.MimeType() == webrtc.MimeTypeOpus {
-					codecParams := track.(*Track).base.codec
-					if codecParams.ClockRate > 0 {
-						sampleRate = uint32(codecParams.ClockRate)
-					}
+				if codecParams.ClockRate > 0 {
+					sampleRate = uint32(codecParams.ClockRate)
+				}
 
-					// Handle channels correctly
-					if codecParams.SDPFmtpLine != "" {
-						// For Opus, channel count is typically in the codec parameters
-						// but alternatively we could use a fixed value of 1 (mono) or 2 (stereo)
-						// since we know it's an audio track
-						channelCount = 1 // Mono is typical for voice calls
-					}
+				// Handle channels correctly
+				if codecParams.SDPFmtpLine != "" {
+					// For Opus, channel count is typically in the codec parameters
+					// but alternatively we could use a fixed value of 1 (mono) or 2 (stereo)
+					// since we know it's an audio track
+					channelCount = 1 // Mono is typical for voice calls
 				}
 
 				// Add participant to recording
@@ -590,24 +597,31 @@ func (r *Room) StartRecording() error {
 		for _, client := range clients {
 			for _, track := range client.Tracks() {
 				if track.Kind() == webrtc.RTPCodecTypeAudio {
-					// Get the opus parameters from the track
+					// Use type switch to handle both Track and AudioTrack types
+					var codecParams webrtc.RTPCodecParameters
+					switch t := track.(type) {
+					case *Track:
+						codecParams = t.base.codec
+					case *AudioTrack:
+						codecParams = t.Track.base.codec
+					default:
+						r.sfu.log.Warnf("room: unknown track type: %T", track)
+						continue
+					}
+
 					sampleRate := uint32(48000) // Default for Opus
 					channelCount := uint16(1)   // Default for Opus
 
-					// Get these from the codec parameters if available
-					if track.MimeType() == webrtc.MimeTypeOpus {
-						codecParams := track.(*Track).base.codec
-						if codecParams.ClockRate > 0 {
-							sampleRate = uint32(codecParams.ClockRate)
-						}
+					if codecParams.ClockRate > 0 {
+						sampleRate = uint32(codecParams.ClockRate)
+					}
 
-						// Handle channels correctly
-						if codecParams.SDPFmtpLine != "" {
-							// For Opus, channel count is typically in the codec parameters
-							// but alternatively we could use a fixed value of 1 (mono) or 2 (stereo)
-							// since we know it's an audio track
-							channelCount = 1 // Mono is typical for voice calls
-						}
+					// Handle channels correctly
+					if codecParams.SDPFmtpLine != "" {
+						// For Opus, channel count is typically in the codec parameters
+						// but alternatively we could use a fixed value of 1 (mono) or 2 (stereo)
+						// since we know it's an audio track
+						channelCount = 1 // Mono is typical for voice calls
 					}
 
 					// Add participant to recording
