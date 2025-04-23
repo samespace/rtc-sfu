@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -68,13 +69,22 @@ func (u *S3Uploader) UploadFile(ctx context.Context, filePath, objectName string
 		s3ObjectName = filepath.Join(u.bucketPrefix, objectName)
 	}
 
+	// Debug log to help with troubleshooting
+	fmt.Printf("Starting S3 upload: file=%s, bucket=%s, object=%s, size=%d bytes\n",
+		filePath, u.bucketName, s3ObjectName, fileInfo.Size())
+
+	// Create a context with a reasonable timeout if the original doesn't have one
+	uploadCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+
 	// Upload file to S3
-	_, err = u.client.PutObject(ctx, u.bucketName, s3ObjectName, file, fileInfo.Size(),
+	_, err = u.client.PutObject(uploadCtx, u.bucketName, s3ObjectName, file, fileInfo.Size(),
 		minio.PutObjectOptions{ContentType: "audio/wav"})
 	if err != nil {
 		return fmt.Errorf("failed to upload file to S3: %w", err)
 	}
 
+	fmt.Printf("Successfully uploaded to S3: bucket=%s, object=%s\n", u.bucketName, s3ObjectName)
 	return nil
 }
 

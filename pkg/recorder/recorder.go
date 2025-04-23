@@ -257,16 +257,35 @@ func (r *RoomRecorder) ResumeRecording() error {
 // StopRecording stops recording for the entire room and merges tracks
 func (r *RoomRecorder) StopRecording() error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	if r.state == RecordingStateStopped {
+		r.mu.Unlock()
 		return nil // Already stopped
 	}
 
 	r.state = RecordingStateStopped
 
-	// Stop all participant recorders
-	for _, rec := range r.participantRecsMap {
+	// Create local copies of all data needed for the async processing
+	roomID := r.roomID
+	recordingID := r.recordingID
+	recordingsPath := r.recordingsPath
+	ffmpegPath := r.ffmpegPath
+	s3Enabled := r.s3Enabled
+	s3Uploader := r.s3Uploader
+	deleteLocal := r.deleteLocal
+	s3BucketPrefix := r.s3BucketPrefix
+
+	// Copy participant data to avoid race conditions
+	type participantData struct {
+		metadata     ParticipantMetadata
+		metadataPath string
+		writer       *oggwriter.OggWriter
+	}
+
+	participantsCopy := make(map[string]participantData)
+
+	// Stop all participant recorders and gather their data
+	for id, rec := range r.participantRecsMap {
 		rec.mu.Lock()
 
 		// Set end time in metadata
@@ -279,110 +298,109 @@ func (r *RoomRecorder) StopRecording() error {
 			rec.metadata.PausedPeriods[lastIdx].End = &now
 		}
 
-		// Update metadata
-		saveMetadata(rec.metadataPath, rec.metadata)
-
-		// Close writer
-		if err := rec.writer.Close(); err != nil {
-			rec.mu.Unlock()
-			return fmt.Errorf("failed to close writer for participant %s: %w", rec.metadata.ParticipantID, err)
+		// Copy metadata
+		participantsCopy[id] = participantData{
+			metadata:     rec.metadata,
+			metadataPath: rec.metadataPath,
+			writer:       rec.writer,
 		}
 
+		// Update original metadata
+		saveMetadata(rec.metadataPath, rec.metadata)
+
+		// Mark as stopped
 		rec.state = RecordingStateStopped
 		rec.cancel()
 		rec.mu.Unlock()
 	}
 
-	// Merge tracks and upload to S3 if enabled (this should be done in a goroutine to not block)
+	// Create a background context that won't be canceled
+	bgCtx := context.Background()
+
+	// Cancel the recorder context now that we've captured all needed data
+	r.cancel()
+	r.mu.Unlock()
+
+	// Process everything asynchronously
 	go func() {
-		// Merge the tracks
-		if err := r.mergeParticipantTracks(); err != nil {
-			// Log the error but don't stop processing
+		// First, close all writers (outside of locks)
+		for _, participant := range participantsCopy {
+			if err := participant.writer.Close(); err != nil {
+				fmt.Printf("Error closing writer: %v\n", err)
+			}
+		}
+
+		// Now perform the merging and upload
+		roomPath := filepath.Join(recordingsPath, recordingID)
+		outputFile := filepath.Join(recordingsPath, recordingID, "merged.wav")
+
+		// Create a new audio merger directly
+		audioMerger := NewAudioMerger(ffmpegPath)
+
+		// Merge the participant recordings
+		if err := audioMerger.MergeParticipantRecordings(roomPath, outputFile); err != nil {
 			fmt.Printf("Error merging tracks: %v\n", err)
 			return
 		}
 
-		// Upload to S3 if enabled
-		if r.s3Enabled && r.s3Uploader != nil {
-			outputFile := filepath.Join(r.recordingsPath, r.recordingID, "merged.wav")
-			objectName := fmt.Sprintf("%s.wav", r.recordingID)
+		// Create metadata for merged file
+		mergedMetadata := struct {
+			RoomID       string                `json:"room_id"`
+			RecordingID  string                `json:"recording_id"`
+			Participants []ParticipantMetadata `json:"participants"`
+			MergedAt     time.Time             `json:"merged_at"`
+			MergedFile   string                `json:"merged_file"`
+			S3Uploaded   bool                  `json:"s3_uploaded,omitempty"`
+			S3ObjectName string                `json:"s3_object_name,omitempty"`
+		}{
+			RoomID:      roomID,
+			RecordingID: recordingID,
+			MergedAt:    time.Now(),
+			MergedFile:  outputFile,
+		}
 
-			if err := r.s3Uploader.UploadFile(r.ctx, outputFile, objectName); err != nil {
+		// Add participant data to metadata
+		for _, participant := range participantsCopy {
+			mergedMetadata.Participants = append(mergedMetadata.Participants, participant.metadata)
+		}
+
+		// Add S3 info to metadata if enabled
+		if s3Enabled {
+			mergedMetadata.S3Uploaded = true
+			if s3BucketPrefix != "" {
+				mergedMetadata.S3ObjectName = filepath.Join(s3BucketPrefix, fmt.Sprintf("%s.wav", recordingID))
+			} else {
+				mergedMetadata.S3ObjectName = fmt.Sprintf("%s.wav", recordingID)
+			}
+		}
+
+		// Save merged metadata
+		mergeMetadataPath := filepath.Join(recordingsPath, recordingID, "merged_metadata.json")
+		if err := saveMetadata(mergeMetadataPath, mergedMetadata); err != nil {
+			fmt.Printf("Error saving merge metadata: %v\n", err)
+		}
+
+		// Upload to S3 if enabled
+		if s3Enabled && s3Uploader != nil {
+			objectName := fmt.Sprintf("%s.wav", recordingID)
+
+			// We use the background context for upload to ensure it's not cancelled
+			if err := s3Uploader.UploadFile(bgCtx, outputFile, objectName); err != nil {
 				fmt.Printf("Error uploading to S3: %v\n", err)
 				return
 			}
 
 			// Clean up local directory if configured to do so
-			if r.deleteLocal {
-				dirPath := filepath.Join(r.recordingsPath, r.recordingID)
-				if err := r.s3Uploader.CleanupDirectory(dirPath); err != nil {
+			if deleteLocal {
+				dirPath := filepath.Join(recordingsPath, recordingID)
+				if err := s3Uploader.CleanupDirectory(dirPath); err != nil {
 					fmt.Printf("Error cleaning up local directory: %v\n", err)
 				}
 			}
 		}
 	}()
 
-	r.cancel()
 	return nil
-}
-
-// mergeParticipantTracks merges all participant tracks into a single audio file
-func (r *RoomRecorder) mergeParticipantTracks() error {
-	// Make sure all recordings are stopped
-	r.mu.RLock()
-	for _, rec := range r.participantRecsMap {
-		if rec.state != RecordingStateStopped {
-			r.mu.RUnlock()
-			return fmt.Errorf("cannot merge tracks while recordings are in progress")
-		}
-	}
-	r.mu.RUnlock()
-
-	// Create output WAV file path
-	outputFile := filepath.Join(r.recordingsPath, r.recordingID, "merged.wav")
-
-	// Merge the recordings using AudioMerger
-	roomPath := filepath.Join(r.recordingsPath, r.recordingID)
-	if err := r.audioMerger.MergeParticipantRecordings(roomPath, outputFile); err != nil {
-		return fmt.Errorf("failed to merge participant recordings: %w", err)
-	}
-
-	// Create merged metadata file
-	mergedMetadata := struct {
-		RoomID       string                `json:"room_id"`
-		RecordingID  string                `json:"recording_id"`
-		Participants []ParticipantMetadata `json:"participants"`
-		MergedAt     time.Time             `json:"merged_at"`
-		MergedFile   string                `json:"merged_file"`
-		S3Uploaded   bool                  `json:"s3_uploaded,omitempty"`
-		S3ObjectName string                `json:"s3_object_name,omitempty"`
-	}{
-		RoomID:      r.roomID,
-		RecordingID: r.recordingID,
-		MergedAt:    time.Now(),
-		MergedFile:  outputFile,
-	}
-
-	r.mu.RLock()
-	for _, rec := range r.participantRecsMap {
-		rec.mu.Lock()
-		mergedMetadata.Participants = append(mergedMetadata.Participants, rec.metadata)
-		rec.mu.Unlock()
-	}
-	r.mu.RUnlock()
-
-	// If S3 upload is enabled, add S3 info to metadata
-	if r.s3Enabled {
-		mergedMetadata.S3Uploaded = true
-		if r.s3BucketPrefix != "" {
-			mergedMetadata.S3ObjectName = filepath.Join(r.s3BucketPrefix, fmt.Sprintf("%s.wav", r.recordingID))
-		} else {
-			mergedMetadata.S3ObjectName = fmt.Sprintf("%s.wav", r.recordingID)
-		}
-	}
-
-	mergeMetadataPath := filepath.Join(r.recordingsPath, r.recordingID, "merged_metadata.json")
-	return saveMetadata(mergeMetadataPath, mergedMetadata)
 }
 
 // saveMetadata saves metadata to a JSON file

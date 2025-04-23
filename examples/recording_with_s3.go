@@ -88,17 +88,34 @@ func main() {
 		log.Fatalf("Failed to stop recording: %v", err)
 	}
 
+	// Wait a bit to give the S3 upload time to start and make some progress
+	log.Println("Waiting for S3 upload to complete (15 seconds)...")
+	time.Sleep(15 * time.Second)
+
 	// Wait for signals to exit gracefully
 	log.Println("Running... press Ctrl+C to exit")
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-	<-c
 
-	// Close the room
-	log.Println("Closing room...")
-	if err := room.Close(); err != nil {
-		log.Printf("Error closing room: %v", err)
-	}
+	// Set up signal handling to gracefully shut down
+	go func() {
+		sig := <-c
+		log.Printf("Received signal %v, shutting down...", sig)
 
-	log.Println("Exiting...")
+		// Give any in-progress uploads time to complete
+		log.Println("Waiting 10 seconds for uploads to complete before closing room...")
+		time.Sleep(10 * time.Second)
+
+		// Close the room
+		log.Println("Closing room...")
+		if err := room.Close(); err != nil {
+			log.Printf("Error closing room: %v", err)
+		}
+
+		log.Println("Exiting...")
+		os.Exit(0)
+	}()
+
+	// Wait indefinitely
+	select {}
 }
