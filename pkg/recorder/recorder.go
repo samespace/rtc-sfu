@@ -292,6 +292,10 @@ func (r *RoomRecorder) StopRecording() error {
 		rec.mu.Unlock()
 	}
 
+	// Create a background context for upload operations that won't be cancelled
+	// when the recorder's context is cancelled
+	uploadCtx := context.Background()
+
 	// Merge tracks (this should be done in a goroutine to not block)
 	go func() {
 		if err := r.mergeParticipantTracks(); err != nil {
@@ -307,8 +311,22 @@ func (r *RoomRecorder) StopRecording() error {
 			// This ensures files are only deleted after successful upload but kept if upload fails
 
 			roomDir := filepath.Join(r.recordingsPath, r.roomID)
-			if err := r.s3Uploader.UploadDirectory(roomDir, r.roomID); err != nil {
+
+			// Create a new S3Uploader with the background context instead of using the one
+			// that will be cancelled by r.cancel() below
+			var uploader *S3Uploader
+			var err error
+
+			if uploader, err = NewS3Uploader(uploadCtx, r.s3Uploader.config); err != nil {
+				fmt.Printf("Error creating S3 uploader: %v\n", err)
+				return
+			}
+			defer uploader.Close()
+
+			if err := uploader.UploadDirectory(roomDir, r.roomID); err != nil {
 				fmt.Printf("Error uploading recordings to S3: %v\n", err)
+			} else {
+				fmt.Printf("Successfully uploaded recordings for room %s to S3\n", r.roomID)
 			}
 		}
 	}()
