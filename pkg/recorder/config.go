@@ -19,6 +19,8 @@ type RecordingConfig struct {
 	// Default audio parameters
 	DefaultSampleRate   uint32 `json:"default_sample_rate"`
 	DefaultChannelCount uint16 `json:"default_channel_count"`
+	// S3 upload configuration (optional)
+	S3Upload *S3UploadConfig `json:"s3_upload,omitempty"`
 }
 
 // ConfigManager manages recording configuration

@@ -62,6 +62,8 @@ type RoomRecorder struct {
 	cancel             context.CancelFunc
 	audioMerger        *AudioMerger
 	ffmpegPath         string
+	s3Uploader         *S3Uploader
+	autoUploadToS3     bool
 }
 
 // NewRoomRecorder creates a new room recorder
@@ -73,6 +75,9 @@ func NewRoomRecorder(ctx context.Context, roomID, recordingsPath, ffmpegPath str
 
 	recCtx, cancel := context.WithCancel(ctx)
 
+	// Create audio merger
+	audioMerger := NewAudioMerger(ffmpegPath)
+
 	return &RoomRecorder{
 		mu:                 sync.RWMutex{},
 		roomID:             roomID,
@@ -81,87 +86,113 @@ func NewRoomRecorder(ctx context.Context, roomID, recordingsPath, ffmpegPath str
 		state:              RecordingStateActive,
 		ctx:                recCtx,
 		cancel:             cancel,
-		audioMerger:        NewAudioMerger(ffmpegPath),
+		audioMerger:        audioMerger,
 		ffmpegPath:         ffmpegPath,
 	}, nil
 }
 
-// AddParticipant adds a new participant to be recorded
+// ConfigureS3Upload sets up the S3 uploader with the given configuration
+func (r *RoomRecorder) ConfigureS3Upload(config *S3UploadConfig) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// If config is nil or not enabled, disable S3 uploads
+	if config == nil || !config.Enabled {
+		r.s3Uploader = nil
+		r.autoUploadToS3 = false
+		return nil
+	}
+
+	// Create uploader
+	uploader, err := NewS3Uploader(r.ctx, *config)
+	if err != nil {
+		return fmt.Errorf("failed to create S3 uploader: %w", err)
+	}
+
+	r.s3Uploader = uploader
+	r.autoUploadToS3 = true
+	return nil
+}
+
+// AddParticipant adds a participant to the recording
 func (r *RoomRecorder) AddParticipant(participantID, trackID string, sampleRate uint32, channelCount uint16) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if r.state == RecordingStateStopped {
+		return fmt.Errorf("recording already stopped")
+	}
+
 	// Check if participant already exists
 	if _, exists := r.participantRecsMap[participantID]; exists {
-		return fmt.Errorf("participant %s already being recorded", participantID)
+		return fmt.Errorf("participant already exists")
 	}
 
 	// Create participant directory
-	participantDirPath := filepath.Join(r.recordingsPath, r.roomID, participantID)
-	if err := os.MkdirAll(participantDirPath, 0755); err != nil {
+	participantDir := filepath.Join(r.recordingsPath, r.roomID, participantID)
+	if err := os.MkdirAll(participantDir, 0755); err != nil {
 		return fmt.Errorf("failed to create participant directory: %w", err)
 	}
 
-	// Create OGG writer
-	audioFilePath := filepath.Join(participantDirPath, "track.ogg")
-	oggWriter, err := oggwriter.New(audioFilePath, sampleRate, channelCount)
+	// Create OGG file
+	oggPath := filepath.Join(participantDir, "track.ogg")
+	writer, err := oggwriter.New(oggPath, sampleRate, channelCount)
 	if err != nil {
-		return fmt.Errorf("failed to create ogg writer: %w", err)
+		return fmt.Errorf("failed to create OGG writer: %w", err)
 	}
 
-	metadataPath := filepath.Join(participantDirPath, "meta.json")
-
-	recCtx, cancel := context.WithCancel(r.ctx)
-
-	// Create participant recorder
+	// Create metadata
+	metadataPath := filepath.Join(participantDir, "meta.json")
 	metadata := ParticipantMetadata{
 		ParticipantID: participantID,
 		TrackID:       trackID,
 		StartTime:     time.Now(),
 	}
 
-	// Save initial metadata
-	if err := saveMetadata(metadataPath, metadata); err != nil {
-		cancel()
-		return fmt.Errorf("failed to save metadata: %w", err)
-	}
+	// Create cancellable context
+	ctx, cancel := context.WithCancel(r.ctx)
 
-	r.participantRecsMap[participantID] = &ParticipantRecorder{
-		mu:            sync.Mutex{},
-		writer:        oggWriter,
+	// Create participant recorder
+	recorder := &ParticipantRecorder{
+		writer:        writer,
 		metadataPath:  metadataPath,
 		metadata:      metadata,
-		state:         RecordingStateActive,
-		ctx:           recCtx,
+		state:         r.state, // inherit room state
+		ctx:           ctx,
 		cancel:        cancel,
 		sampleRate:    sampleRate,
 		channelCount:  channelCount,
 		lastTimestamp: time.Now(),
 	}
 
+	// Save metadata
+	if err := saveMetadata(metadataPath, metadata); err != nil {
+		cancel()
+		return fmt.Errorf("failed to save metadata: %w", err)
+	}
+
+	r.participantRecsMap[participantID] = recorder
 	return nil
 }
 
-// WriteRTP writes an RTP packet for a specific participant
+// WriteRTP writes an RTP packet for a participant
 func (r *RoomRecorder) WriteRTP(participantID string, packet *rtp.Packet) error {
 	r.mu.RLock()
 	recorder, exists := r.participantRecsMap[participantID]
 	r.mu.RUnlock()
 
 	if !exists {
-		return fmt.Errorf("participant %s not found", participantID)
+		return fmt.Errorf("participant not found")
 	}
 
 	recorder.mu.Lock()
 	defer recorder.mu.Unlock()
 
-	// Only write if recording is active
-	if recorder.state == RecordingStateActive {
-		recorder.lastTimestamp = time.Now()
-		return recorder.writer.WriteRTP(packet)
+	if recorder.state != RecordingStateActive {
+		return nil // Silently ignore if not active
 	}
 
-	return nil
+	return recorder.writer.WriteRTP(packet)
 }
 
 // PauseRecording pauses recording for the entire room
@@ -169,25 +200,22 @@ func (r *RoomRecorder) PauseRecording() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if r.state == RecordingStatePaused {
-		return nil // Already paused
+	if r.state != RecordingStateActive {
+		return nil // Already paused or stopped
 	}
 
 	r.state = RecordingStatePaused
 
-	// Pause all participant recorders
 	for _, rec := range r.participantRecsMap {
 		rec.mu.Lock()
 		if rec.state == RecordingStateActive {
 			rec.state = RecordingStatePaused
-			pausePeriod := struct {
+			rec.metadata.PausedPeriods = append(rec.metadata.PausedPeriods, struct {
 				Start time.Time  `json:"start"`
 				End   *time.Time `json:"end,omitempty"`
 			}{
 				Start: time.Now(),
-			}
-			rec.metadata.PausedPeriods = append(rec.metadata.PausedPeriods, pausePeriod)
-			// Update metadata
+			})
 			saveMetadata(rec.metadataPath, rec.metadata)
 		}
 		rec.mu.Unlock()
@@ -201,22 +229,22 @@ func (r *RoomRecorder) ResumeRecording() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if r.state == RecordingStateActive {
-		return nil // Already active
+	if r.state != RecordingStatePaused {
+		return nil // Not paused
 	}
 
 	r.state = RecordingStateActive
 
-	// Resume all participant recorders
+	now := time.Now()
 	for _, rec := range r.participantRecsMap {
 		rec.mu.Lock()
-		if rec.state == RecordingStatePaused && len(rec.metadata.PausedPeriods) > 0 {
+		if rec.state == RecordingStatePaused {
 			rec.state = RecordingStateActive
-			// Update the end time of the last pause period
-			lastIdx := len(rec.metadata.PausedPeriods) - 1
-			now := time.Now()
-			rec.metadata.PausedPeriods[lastIdx].End = &now
-			// Update metadata
+			// Set end time for the last pause period
+			if len(rec.metadata.PausedPeriods) > 0 {
+				lastIdx := len(rec.metadata.PausedPeriods) - 1
+				rec.metadata.PausedPeriods[lastIdx].End = &now
+			}
 			saveMetadata(rec.metadataPath, rec.metadata)
 		}
 		rec.mu.Unlock()
@@ -269,6 +297,14 @@ func (r *RoomRecorder) StopRecording() error {
 		if err := r.mergeParticipantTracks(); err != nil {
 			// Log the error but don't stop processing
 			fmt.Printf("Error merging tracks: %v\n", err)
+		}
+
+		// Upload to S3 if enabled
+		if r.autoUploadToS3 && r.s3Uploader != nil {
+			roomDir := filepath.Join(r.recordingsPath, r.roomID)
+			if err := r.s3Uploader.UploadDirectory(roomDir, r.roomID); err != nil {
+				fmt.Printf("Error uploading recordings to S3: %v\n", err)
+			}
 		}
 	}()
 
@@ -381,4 +417,33 @@ func (r *RoomRecorder) GetState() RecordingState {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.state
+}
+
+// UploadToS3 manually uploads the recordings to S3
+func (r *RoomRecorder) UploadToS3() error {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if r.s3Uploader == nil {
+		return fmt.Errorf("s3 uploader not configured")
+	}
+
+	if r.state != RecordingStateStopped {
+		return fmt.Errorf("cannot upload recordings while recording is in progress")
+	}
+
+	roomDir := filepath.Join(r.recordingsPath, r.roomID)
+	return r.s3Uploader.UploadDirectory(roomDir, r.roomID)
+}
+
+// GetS3UploadStatus returns the status of the S3 upload
+func (r *RoomRecorder) GetS3UploadStatus() (bool, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if r.s3Uploader == nil {
+		return false, fmt.Errorf("s3 uploader not configured")
+	}
+
+	return r.s3Uploader.GetUploadStatus(r.roomID)
 }

@@ -109,6 +109,29 @@ type RecordingOptions struct {
 	FFmpegPath string `json:"ffmpeg_path"`
 	// Auto-merge recordings when room closes
 	AutoMerge bool `json:"auto_merge"`
+	// S3 bucket configuration
+	S3Upload *S3UploadConfig `json:"s3_upload,omitempty"`
+}
+
+// S3UploadConfig contains configuration for uploading recordings to S3
+type S3UploadConfig struct {
+	// Whether to upload recordings to S3
+	Enabled bool `json:"enabled"`
+	// S3 bucket name
+	BucketName string `json:"bucket_name"`
+	// S3 endpoint (e.g., "s3.amazonaws.com" for AWS, "play.min.io:9000" for Minio)
+	Endpoint string `json:"endpoint"`
+	// Region (optional, can be empty for Minio)
+	Region string `json:"region,omitempty"`
+	// S3 key prefix (folder path)
+	KeyPrefix string `json:"key_prefix,omitempty"`
+	// AWS credentials
+	AccessKeyID     string `json:"access_key_id,omitempty"`
+	SecretAccessKey string `json:"secret_access_key,omitempty"`
+	// Use SSL/TLS for connection
+	UseSSL bool `json:"use_ssl"`
+	// Whether to delete local files after successful upload
+	DeleteAfterUpload bool `json:"delete_after_upload,omitempty"`
 }
 
 func DefaultRoomOptions() RoomOptions {
@@ -125,6 +148,15 @@ func DefaultRoomOptions() RoomOptions {
 			RecordingsPath: "recordings",
 			FFmpegPath:     "ffmpeg",
 			AutoMerge:      true,
+			S3Upload: &S3UploadConfig{
+				Enabled:           false,
+				BucketName:        "",
+				Endpoint:          "s3.amazonaws.com",
+				Region:            "",
+				KeyPrefix:         "",
+				UseSSL:            true,
+				DeleteAfterUpload: false,
+			},
 		},
 	}
 }
@@ -165,6 +197,26 @@ func newRoom(id, name string, sfu *SFU, kind string, opts RoomOptions) *Room {
 			sfu.log.Errorf("room: failed to initialize recorder: %v", err)
 		} else {
 			room.recorder = rec
+
+			// Configure S3 upload if enabled
+			if opts.Recording.S3Upload != nil && opts.Recording.S3Upload.Enabled {
+				s3Config := &recorder.S3UploadConfig{
+					Enabled:           opts.Recording.S3Upload.Enabled,
+					BucketName:        opts.Recording.S3Upload.BucketName,
+					Endpoint:          opts.Recording.S3Upload.Endpoint,
+					Region:            opts.Recording.S3Upload.Region,
+					KeyPrefix:         opts.Recording.S3Upload.KeyPrefix,
+					AccessKeyID:       opts.Recording.S3Upload.AccessKeyID,
+					SecretAccessKey:   opts.Recording.S3Upload.SecretAccessKey,
+					UseSSL:            opts.Recording.S3Upload.UseSSL,
+					DeleteAfterUpload: opts.Recording.S3Upload.DeleteAfterUpload,
+				}
+
+				if err := room.recorder.ConfigureS3Upload(s3Config); err != nil {
+					sfu.log.Warnf("room: failed to configure S3 upload: %v", err)
+				}
+			}
+
 			sfu.log.Infof("room: recording enabled for room %s", id)
 
 			if room.OnEvent != nil {
@@ -587,6 +639,25 @@ func (r *Room) StartRecording() error {
 		rec, err := recorder.NewRoomRecorder(r.context, r.id, config.RecordingsPath, config.FFmpegPath)
 		if err != nil {
 			return err
+		}
+
+		// Configure S3 upload if enabled
+		if r.options.Recording != nil && r.options.Recording.S3Upload != nil && r.options.Recording.S3Upload.Enabled {
+			s3Config := &recorder.S3UploadConfig{
+				Enabled:           r.options.Recording.S3Upload.Enabled,
+				BucketName:        r.options.Recording.S3Upload.BucketName,
+				Endpoint:          r.options.Recording.S3Upload.Endpoint,
+				Region:            r.options.Recording.S3Upload.Region,
+				KeyPrefix:         r.options.Recording.S3Upload.KeyPrefix,
+				AccessKeyID:       r.options.Recording.S3Upload.AccessKeyID,
+				SecretAccessKey:   r.options.Recording.S3Upload.SecretAccessKey,
+				UseSSL:            r.options.Recording.S3Upload.UseSSL,
+				DeleteAfterUpload: r.options.Recording.S3Upload.DeleteAfterUpload,
+			}
+
+			if err := rec.ConfigureS3Upload(s3Config); err != nil {
+				r.sfu.log.Warnf("room: failed to configure S3 upload: %v", err)
+			}
 		}
 
 		r.recorder = rec
