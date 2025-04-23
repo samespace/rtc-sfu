@@ -99,10 +99,12 @@ func main() {
 
 		// Resume recording after 10 more seconds
 		time.Sleep(10 * time.Second)
-		if err := room.StartRecording(); err != nil {
+		// Use a custom recording ID (timestamp-based)
+		recordingID := "session_" + time.Now().Format("20060102_150405")
+		if err := room.StartRecording(recordingID); err != nil {
 			log.Printf("Failed to resume recording: %v", err)
 		} else {
-			log.Println("Recording resumed")
+			log.Println("Recording resumed with ID:", recordingID)
 		}
 
 		// Get the recording state

@@ -216,6 +216,10 @@ func (u *S3Uploader) GetUploadStatus(identifier string) (bool, error) {
 func (u *S3Uploader) processUploads() {
 	defer u.wg.Done()
 
+	// Map to keep track of uploaded paths for directory cleanup
+	uploadedFiles := make(map[string]bool)
+	pendingDirs := make(map[string]bool)
+
 	for {
 		select {
 		case <-u.ctx.Done():
@@ -236,8 +240,55 @@ func (u *S3Uploader) processUploads() {
 
 			// Delete local file if configured and upload was successful
 			if success && u.config.DeleteAfterUpload {
+				// Add to uploaded files
+				uploadedFiles[task.localPath] = true
+
+				// Track directory
+				dir := filepath.Dir(task.localPath)
+				pendingDirs[dir] = true
+
+				// Delete file
 				os.Remove(task.localPath)
+
+				// Check if directory is empty and can be deleted
+				u.cleanupEmptyDirs(dir, pendingDirs)
 			}
+		}
+	}
+}
+
+// cleanupEmptyDirs checks if the directory is empty and deletes it if so,
+// then recursively checks parent directories
+func (u *S3Uploader) cleanupEmptyDirs(dir string, pendingDirs map[string]bool) {
+	if !u.config.DeleteAfterUpload {
+		return
+	}
+
+	// Check if directory exists
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		delete(pendingDirs, dir)
+		return
+	}
+
+	// Check if directory is empty
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+
+	// If directory is not empty, don't delete
+	if len(entries) > 0 {
+		return
+	}
+
+	// Delete empty directory
+	if err := os.Remove(dir); err == nil {
+		delete(pendingDirs, dir)
+
+		// Recursively check parent directory
+		parent := filepath.Dir(dir)
+		if parent != dir && pendingDirs[parent] {
+			u.cleanupEmptyDirs(parent, pendingDirs)
 		}
 	}
 }

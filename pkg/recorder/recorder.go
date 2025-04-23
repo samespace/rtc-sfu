@@ -300,7 +300,12 @@ func (r *RoomRecorder) StopRecording() error {
 		}
 
 		// Upload to S3 if enabled
-		if r.autoUploadToS3 && r.s3Uploader != nil {
+		if r.s3Uploader != nil {
+			r.autoUploadToS3 = true // Ensure auto-upload is enabled
+
+			// Don't force DeleteAfterUpload to true, respect original configuration
+			// This ensures files are only deleted after successful upload but kept if upload fails
+
 			roomDir := filepath.Join(r.recordingsPath, r.roomID)
 			if err := r.s3Uploader.UploadDirectory(roomDir, r.roomID); err != nil {
 				fmt.Printf("Error uploading recordings to S3: %v\n", err)

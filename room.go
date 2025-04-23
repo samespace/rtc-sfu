@@ -155,7 +155,7 @@ func DefaultRoomOptions() RoomOptions {
 				Region:            "",
 				KeyPrefix:         "",
 				UseSSL:            true,
-				DeleteAfterUpload: false,
+				DeleteAfterUpload: true,
 			},
 		},
 	}
@@ -612,13 +612,18 @@ func (r *Room) loopRecordStats() {
 	}
 }
 
-// StartRecording starts recording for the room
-func (r *Room) StartRecording() error {
+// StartRecording starts recording for the room with an optional custom recording ID
+func (r *Room) StartRecording(recordingID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if r.state == StateRoomClosed {
 		return ErrRoomIsClosed
+	}
+
+	// If no recording ID is provided, generate a unique one
+	if recordingID == "" {
+		recordingID = r.id + "_" + GenerateID(8)
 	}
 
 	if !r.isRecordingEnabled {
@@ -635,8 +640,8 @@ func (r *Room) StartRecording() error {
 
 		_ = r.recordingConfigMgr.UpdateConfig(config)
 
-		// Create room recorder
-		rec, err := recorder.NewRoomRecorder(r.context, r.id, config.RecordingsPath, config.FFmpegPath)
+		// Create room recorder with the custom recording ID
+		rec, err := recorder.NewRoomRecorder(r.context, recordingID, config.RecordingsPath, config.FFmpegPath)
 		if err != nil {
 			return err
 		}
@@ -652,7 +657,7 @@ func (r *Room) StartRecording() error {
 				AccessKeyID:       r.options.Recording.S3Upload.AccessKeyID,
 				SecretAccessKey:   r.options.Recording.S3Upload.SecretAccessKey,
 				UseSSL:            r.options.Recording.S3Upload.UseSSL,
-				DeleteAfterUpload: r.options.Recording.S3Upload.DeleteAfterUpload,
+				DeleteAfterUpload: true, // Always clean up local files after upload
 			}
 
 			if err := rec.ConfigureS3Upload(s3Config); err != nil {
@@ -717,7 +722,8 @@ func (r *Room) StartRecording() error {
 				Type: EventRecordingStart,
 				Time: time.Now(),
 				Data: map[string]interface{}{
-					"room_id": r.id,
+					"room_id":      r.id,
+					"recording_id": recordingID,
 				},
 			})
 		}

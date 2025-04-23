@@ -43,8 +43,15 @@ room := sfuInstance.NewRoom("roomID", "Room Name", roomOpts)
 You can also control recording during the room's lifetime:
 
 ```go
-// Start recording
-err := room.StartRecording()
+// Start recording with a custom ID (allows multiple recording sessions)
+recordingID := "custom_recording_id_123"
+err := room.StartRecording(recordingID)
+if err != nil {
+    log.Printf("Failed to start recording: %v", err)
+}
+
+// If you don't provide a recording ID, a unique one will be generated
+err = room.StartRecording("") 
 if err != nil {
     log.Printf("Failed to start recording: %v", err)
 }
@@ -55,8 +62,8 @@ if err != nil {
     log.Printf("Failed to pause recording: %v", err)
 }
 
-// Resume recording
-err = room.StartRecording() // also used for resuming
+// Resume recording (pass the same recording ID to continue in the same directory)
+err = room.StartRecording(recordingID) 
 if err != nil {
     log.Printf("Failed to resume recording: %v", err)
 }
@@ -82,7 +89,8 @@ The SFU will fire events related to recording that you can listen for using the 
 room.OnEvent = func(event sfu.Event) {
     switch event.Type {
     case sfu.EventRecordingStart:
-        log.Printf("Recording started for room %s", event.Data["room_id"])
+        log.Printf("Recording started for room %s with ID %s", 
+            event.Data["room_id"], event.Data["recording_id"])
     case sfu.EventRecordingPause:
         log.Printf("Recording paused for room %s", event.Data["room_id"])
     case sfu.EventRecordingResume:
@@ -92,6 +100,40 @@ room.OnEvent = func(event sfu.Event) {
     }
 }
 ```
+
+## S3 Upload Configuration
+
+You can configure the SFU to automatically upload recordings to S3-compatible storage (including AWS S3, Minio, DigitalOcean Spaces, etc.):
+
+```go
+roomOpts := sfu.DefaultRoomOptions()
+roomOpts.Recording = &sfu.RecordingOptions{
+    Enabled:        true,
+    RecordingsPath: "recordings",
+    FFmpegPath:     "ffmpeg",
+    AutoMerge:      true,
+    S3Upload: &sfu.S3UploadConfig{
+        Enabled:           true,
+        BucketName:        "my-recordings-bucket",
+        Endpoint:          "s3.amazonaws.com", // For AWS S3
+        // Endpoint:       "play.min.io:9000", // For Minio
+        Region:            "us-east-1",        // Optional for Minio
+        KeyPrefix:         "calls/",           // Optional folder path in the bucket
+        AccessKeyID:       "YOUR_ACCESS_KEY",
+        SecretAccessKey:   "YOUR_SECRET_KEY",
+        UseSSL:            true,
+        DeleteAfterUpload: true,              // Cleanup local files after upload
+    },
+}
+
+room := sfuInstance.NewRoom("roomID", "Room Name", roomOpts)
+```
+
+The recordings will be automatically uploaded to the S3 bucket when:
+1. The room is closed
+2. The recording is stopped using `StopRecording()`
+
+After upload is complete, local files will be cleaned up if `DeleteAfterUpload` is true.
 
 ## Storage Structure
 
