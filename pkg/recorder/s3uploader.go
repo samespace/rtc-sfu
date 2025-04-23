@@ -185,6 +185,7 @@ func (u *S3Uploader) UploadSingleFile(localPath, identifier, targetFileName stri
 	}
 
 	// Queue the upload task
+	fmt.Printf("(Queueing) Uploading file to S3: %s\n", s3Key)
 	select {
 	case u.uploadQueue <- uploadTask{
 		localPath:  localPath,
@@ -346,6 +347,7 @@ func (u *S3Uploader) cleanupEmptyDirs(dir string, pendingDirs map[string]bool) {
 
 // uploadToS3 uploads a single file to S3
 func (u *S3Uploader) uploadToS3(localPath, s3Key string) (bool, error) {
+	fmt.Printf("(Uploading) Uploading file to S3: %s\n", s3Key)
 	file, err := os.Open(localPath)
 	if err != nil {
 		return false, fmt.Errorf("failed to open file: %w", err)
@@ -378,6 +380,8 @@ func (u *S3Uploader) uploadToS3(localPath, s3Key string) (bool, error) {
 		fileInfo.Size(),
 		minio.PutObjectOptions{ContentType: contentType},
 	)
+
+	fmt.Printf("(Uploaded) Uploaded file to S3: %s\n", s3Key)
 
 	if err != nil {
 		return false, fmt.Errorf("failed to upload file to S3: %w", err)
