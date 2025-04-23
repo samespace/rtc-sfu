@@ -129,6 +129,8 @@ func (u *S3Uploader) UploadFile(localPath, identifier string) error {
 		return fmt.Errorf("s3 upload not enabled")
 	}
 
+	fmt.Println("(UploadFile) localPath:", localPath, "identifier:", identifier, "u.config:", u.config.KeyPrefix)
+
 	// Determine S3 key from local path
 	fileName := filepath.Base(localPath)
 	s3Key := fileName
@@ -381,7 +383,7 @@ func (u *S3Uploader) uploadToS3(localPath, s3Key string) (bool, error) {
 		minio.PutObjectOptions{ContentType: contentType},
 	)
 
-	fmt.Printf("(Uploaded) Uploaded file to S3: %s\n", s3Key)
+	fmt.Println("(Uploaded) Uploaded file to S3:", s3Key, err)
 
 	if err != nil {
 		return false, fmt.Errorf("failed to upload file to S3: %w", err)
