@@ -162,6 +162,9 @@ func (u *S3Uploader) UploadFile(localPath, identifier string) error {
 
 // UploadSingleFile uploads only the specified file to S3
 func (u *S3Uploader) UploadSingleFile(localPath, identifier, targetFileName string) error {
+
+	fmt.Println("(UploadSingleFile) localPath:", localPath, "identifier:", identifier, "u.config:", u.config.KeyPrefix)
+
 	if !u.config.Enabled {
 		return fmt.Errorf("s3 upload not enabled")
 	}
