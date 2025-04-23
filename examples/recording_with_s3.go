@@ -21,22 +21,8 @@ func main() {
 	sfuOpts := sfu.DefaultOptions()
 	manager := sfu.NewManager(ctx, "s3-recording-demo", sfuOpts)
 
-	// Configure a room with recording enabled and S3 upload
+	// Configure a room with standard options (no recording configuration)
 	roomOpts := sfu.DefaultRoomOptions()
-	roomOpts.Recording = &sfu.RecordingOptions{
-		Enabled:           true,
-		RecordingsPath:    "recordings",
-		FFmpegPath:        "ffmpeg",
-		AutoMerge:         true,
-		S3Upload:          true,
-		S3Endpoint:        os.Getenv("S3_ENDPOINT"),          // e.g., "play.minio.io:9000"
-		S3AccessKeyID:     os.Getenv("S3_ACCESS_KEY_ID"),     // Your S3 access key
-		S3SecretAccessKey: os.Getenv("S3_SECRET_ACCESS_KEY"), // Your S3 secret key
-		S3UseSSL:          true,
-		S3BucketName:      os.Getenv("S3_BUCKET_NAME"), // Your S3 bucket name
-		S3BucketPrefix:    "calls/",                    // Optional prefix
-		DeleteAfterUpload: true,                        // Delete local files after upload
-	}
 
 	// Create a new room
 	roomID := manager.CreateRoomID()
@@ -64,21 +50,30 @@ func main() {
 		}
 	}
 
-	// Example of starting a new recording session with a custom identifier
+	// Generate a unique recording ID
 	recordingID := fmt.Sprintf("call-%d", time.Now().Unix())
 	log.Printf("Starting recording with ID: %s", recordingID)
 
+	// Configure recording with S3 upload - this is the ONLY place where recording is configured
 	s3Config := &sfu.RecordingOptions{
+		// Basic recording configuration
+		Enabled:        true,
+		RecordingsPath: "recordings",
+		FFmpegPath:     "ffmpeg",
+		AutoMerge:      true,
+
+		// S3 upload configuration
 		S3Upload:          true,
 		S3Endpoint:        os.Getenv("S3_ENDPOINT"),
 		S3AccessKeyID:     os.Getenv("S3_ACCESS_KEY_ID"),
 		S3SecretAccessKey: os.Getenv("S3_SECRET_ACCESS_KEY"),
 		S3UseSSL:          true,
 		S3BucketName:      os.Getenv("S3_BUCKET_NAME"),
-		S3BucketPrefix:    "meetings/", // Different prefix for this recording
+		S3BucketPrefix:    "meetings/",
 		DeleteAfterUpload: true,
 	}
 
+	// Start recording with the configuration
 	if err := room.StartRecording(recordingID, s3Config); err != nil {
 		log.Fatalf("Failed to start recording: %v", err)
 	}

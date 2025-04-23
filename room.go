@@ -95,8 +95,6 @@ type RoomOptions struct {
 	QualityLevels []QualityLevel `json:"quality_levels,omitempty"`
 	// Configure the timeout in nanonseconds when the room is empty it will close after the timeout exceeded. Default is 5 minutes
 	EmptyRoomTimeout *time.Duration `json:"empty_room_timeout_ns,ompitempty" example:"300000000000" default:"300000000000"`
-	// Configure recording options for the room
-	Recording *RecordingOptions `json:"recording,omitempty"`
 }
 
 // RecordingOptions contains options for recording the room
@@ -125,15 +123,6 @@ func DefaultRoomOptions() RoomOptions {
 		Codecs:           &[]string{webrtc.MimeTypeVP9, webrtc.MimeTypeH264, webrtc.MimeTypeVP8, "audio/red", webrtc.MimeTypeOpus},
 		PLIInterval:      &pli,
 		EmptyRoomTimeout: &emptyDuration,
-		Recording: &RecordingOptions{
-			Enabled:           false,
-			RecordingsPath:    "recordings",
-			FFmpegPath:        "ffmpeg",
-			AutoMerge:         true,
-			S3Upload:          false,
-			S3UseSSL:          true,
-			DeleteAfterUpload: false,
-		},
 	}
 }
 
@@ -154,58 +143,7 @@ func newRoom(id, name string, sfu *SFU, kind string, opts RoomOptions) *Room {
 		extensions:         make([]IExtension, 0),
 		kind:               kind,
 		options:            opts,
-		isRecordingEnabled: opts.Recording != nil && opts.Recording.Enabled,
-	}
-
-	// Initialize recording if enabled
-	if room.isRecordingEnabled && opts.Recording != nil {
-		// Create recorder config
-		room.recordingConfigMgr = recorder.NewConfigManager()
-		recordingConfig := room.recordingConfigMgr.GetConfig()
-		recordingConfig.RecordingsPath = opts.Recording.RecordingsPath
-		recordingConfig.FFmpegPath = opts.Recording.FFmpegPath
-		recordingConfig.AutoMerge = opts.Recording.AutoMerge
-
-		// Configure S3 settings if enabled
-		if opts.Recording.S3Upload {
-			recordingConfig.S3Upload = true
-			recordingConfig.S3Endpoint = opts.Recording.S3Endpoint
-			recordingConfig.S3AccessKey = opts.Recording.S3AccessKeyID
-			recordingConfig.S3SecretKey = opts.Recording.S3SecretAccessKey
-			recordingConfig.S3UseSSL = opts.Recording.S3UseSSL
-			recordingConfig.S3BucketName = opts.Recording.S3BucketName
-			recordingConfig.S3BucketPrefix = opts.Recording.S3BucketPrefix
-			recordingConfig.DeleteAfterUpload = opts.Recording.DeleteAfterUpload
-		}
-
-		_ = room.recordingConfigMgr.UpdateConfig(recordingConfig)
-
-		// Initialize room recorder using room ID as identifier
-		rec, err := recorder.NewRoomRecorder(localContext, id, recordingConfig.RecordingsPath, recordingConfig.FFmpegPath)
-		if err != nil {
-			sfu.log.Errorf("room: failed to initialize recorder: %v", err)
-		} else {
-			// Configure S3 upload if enabled
-			if recordingConfig.S3Upload {
-				s3Creds := room.recordingConfigMgr.GetS3Credentials()
-				if err := rec.SetS3Config(true, s3Creds, recordingConfig.DeleteAfterUpload); err != nil {
-					sfu.log.Warnf("room: failed to configure S3: %v", err)
-				}
-			}
-
-			room.recorder = rec
-			sfu.log.Infof("room: recording enabled for room %s", id)
-
-			if room.OnEvent != nil {
-				room.OnEvent(Event{
-					Type: EventRecordingStart,
-					Time: time.Now(),
-					Data: map[string]interface{}{
-						"room_id": id,
-					},
-				})
-			}
-		}
+		isRecordingEnabled: false,
 	}
 
 	sfu.OnClientRemoved(func(client *Client) {
@@ -625,18 +563,26 @@ func (r *Room) StartRecording(identifier string, s3Config *RecordingOptions) err
 		r.recordingConfigMgr = recorder.NewConfigManager()
 		config := r.recordingConfigMgr.GetConfig()
 
-		// Use default options from room options if available
-		if r.options.Recording != nil {
-			config.RecordingsPath = r.options.Recording.RecordingsPath
-			config.FFmpegPath = r.options.Recording.FFmpegPath
-			config.AutoMerge = r.options.Recording.AutoMerge
-		}
+		// Set default configuration
+		config.RecordingsPath = "recordings"
+		config.FFmpegPath = "ffmpeg"
+		config.AutoMerge = true
 
 		// Override with provided S3 configuration if available
 		if s3Config != nil {
 			// Update recording path if provided
 			if s3Config.RecordingsPath != "" {
 				config.RecordingsPath = s3Config.RecordingsPath
+			}
+
+			// Update FFmpeg path if provided
+			if s3Config.FFmpegPath != "" {
+				config.FFmpegPath = s3Config.FFmpegPath
+			}
+
+			// Update auto merge if provided
+			if !s3Config.AutoMerge {
+				config.AutoMerge = s3Config.AutoMerge
 			}
 
 			// Set S3 configuration

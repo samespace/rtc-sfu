@@ -4,7 +4,7 @@ This document describes how to use the recording functionality in the SFU.
 
 ## Overview
 
-The SFU now supports recording of audio tracks for each participant in a room. The recordings are stored in OGG format and can be merged into a single WAV file after the room is closed. Optionally, the merged recording can be uploaded to an S3-compatible storage.
+The SFU supports recording of audio tracks for each participant in a room. The recordings are stored in OGG format and can be merged into a single WAV file after the room is closed. Optionally, the merged recording can be uploaded to an S3-compatible storage.
 
 Features:
 - Record audio for each participant separately
@@ -23,19 +23,21 @@ Features:
 
 ## Configuration
 
-Recording can be enabled either at room creation time or dynamically during the room's lifetime.
+Recording is configured and started dynamically during the room's lifetime using the `StartRecording` method.
 
-### Enable at Room Creation
+### Recording Configuration
 
-To enable recording when creating a room, include the recording options in the room options:
+To start recording, call the `StartRecording` method with an identifier and recording options:
 
 ```go
-roomOpts := sfu.DefaultRoomOptions()
-roomOpts.Recording = &sfu.RecordingOptions{
-    Enabled:           true,                // Enable recording
-    RecordingsPath:    "/path/to/recordings", // Path to store recordings
-    FFmpegPath:        "ffmpeg",            // Path to FFmpeg executable (optional)
-    AutoMerge:         true,                // Auto merge recordings when room is closed
+// Configure recording with S3 upload options
+s3Config := &sfu.RecordingOptions{
+    // Basic recording configuration
+    Enabled:        true,                // Enable recording
+    RecordingsPath: "/path/to/recordings", // Path to store recordings
+    FFmpegPath:     "ffmpeg",            // Path to FFmpeg executable (optional)
+    AutoMerge:      true,                // Auto merge recordings when room is closed
+    
     // S3 upload configuration (optional)
     S3Upload:          true,                // Enable S3 upload
     S3Endpoint:        "s3.amazonaws.com",  // S3 endpoint
@@ -47,33 +49,21 @@ roomOpts.Recording = &sfu.RecordingOptions{
     DeleteAfterUpload: true,                // Delete local files after successful upload
 }
 
-room := sfuInstance.NewRoom("roomID", "Room Name", roomOpts)
-```
-
-### Dynamic Recording Control
-
-You can also control recording during the room's lifetime:
-
-```go
-// Start recording with a custom identifier and S3 configuration
+// Start recording with a custom identifier
 identifier := "session-123" // Unique identifier for this recording session
-s3Config := &sfu.RecordingOptions{
-    S3Upload:          true,
-    S3Endpoint:        "s3.amazonaws.com",
-    S3AccessKeyID:     "your-access-key",
-    S3SecretAccessKey: "your-secret-key",
-    S3UseSSL:          true,
-    S3BucketName:      "your-bucket",
-    S3BucketPrefix:    "recordings/",
-    DeleteAfterUpload: true,
-}
 err := room.StartRecording(identifier, s3Config)
 if err != nil {
     log.Printf("Failed to start recording: %v", err)
 }
+```
 
-// You can start multiple recording sessions for the same room with different identifiers
-err = room.StartRecording("session-124", s3Config)
+### Recording Control
+
+Once recording is started, you can control it using the following methods:
+
+```go
+// Start multiple recording sessions for the same room with different identifiers
+err = room.StartRecording("session-124", anotherS3Config)
 
 // Pause recording
 err = room.PauseRecording()
@@ -81,8 +71,8 @@ if err != nil {
     log.Printf("Failed to pause recording: %v", err)
 }
 
-// Resume recording
-err = room.StartRecording("", nil) // Use empty identifier to resume the current session
+// Resume recording - pass empty identifier and nil config to resume current session
+err = room.StartRecording("", nil)
 if err != nil {
     log.Printf("Failed to resume recording: %v", err)
 }
@@ -116,6 +106,10 @@ room.OnEvent = func(event sfu.Event) {
         log.Printf("Recording resumed for room %s", event.Data["room_id"])
     case sfu.EventRecordingStop:
         log.Printf("Recording stopped for room %s", event.Data["room_id"])
+        if s3Upload, ok := event.Data["s3_upload"].(bool); ok && s3Upload {
+            log.Printf("Recording will be uploaded to S3: bucket=%s prefix=%s",
+                event.Data["s3_bucket"], event.Data["s3_prefix"])
+        }
     }
 }
 ```
