@@ -4,19 +4,22 @@ This document describes how to use the recording functionality in the SFU.
 
 ## Overview
 
-The SFU now supports recording of audio tracks for each participant in a room. The recordings are stored in OGG format and can be merged into a single WAV file after the room is closed.
+The SFU now supports recording of audio tracks for each participant in a room. The recordings are stored in OGG format and can be merged into a single WAV file after the room is closed. Optionally, the merged recording can be uploaded to an S3-compatible storage.
 
 Features:
 - Record audio for each participant separately
 - Pause and resume recording
 - Store metadata for each recording
 - Merge all participant recordings into a single file
+- Upload the merged recording to S3-compatible storage
 - Configure recording path and other settings
+- Support for multiple recording sessions per room with unique identifiers
 
 ## Requirements
 
 - FFmpeg must be installed on the system (or path to FFmpeg executable must be provided in config)
 - Opus codec must be used for audio (which is the default)
+- For S3 upload: Access to an S3-compatible storage service (like AWS S3, MinIO, etc.)
 
 ## Configuration
 
@@ -29,10 +32,19 @@ To enable recording when creating a room, include the recording options in the r
 ```go
 roomOpts := sfu.DefaultRoomOptions()
 roomOpts.Recording = &sfu.RecordingOptions{
-    Enabled:        true,                // Enable recording
-    RecordingsPath: "/path/to/recordings", // Path to store recordings
-    FFmpegPath:     "ffmpeg",            // Path to FFmpeg executable (optional)
-    AutoMerge:      true,                // Auto merge recordings when room is closed
+    Enabled:           true,                // Enable recording
+    RecordingsPath:    "/path/to/recordings", // Path to store recordings
+    FFmpegPath:        "ffmpeg",            // Path to FFmpeg executable (optional)
+    AutoMerge:         true,                // Auto merge recordings when room is closed
+    // S3 upload configuration (optional)
+    S3Upload:          true,                // Enable S3 upload
+    S3Endpoint:        "s3.amazonaws.com",  // S3 endpoint
+    S3AccessKeyID:     "your-access-key",   // S3 access key
+    S3SecretAccessKey: "your-secret-key",   // S3 secret key
+    S3UseSSL:          true,                // Use SSL for S3 connections
+    S3BucketName:      "your-bucket",       // S3 bucket name
+    S3BucketPrefix:    "recordings/",       // Prefix for S3 objects (optional)
+    DeleteAfterUpload: true,                // Delete local files after successful upload
 }
 
 room := sfuInstance.NewRoom("roomID", "Room Name", roomOpts)
@@ -43,11 +55,25 @@ room := sfuInstance.NewRoom("roomID", "Room Name", roomOpts)
 You can also control recording during the room's lifetime:
 
 ```go
-// Start recording
-err := room.StartRecording()
+// Start recording with a custom identifier and S3 configuration
+identifier := "session-123" // Unique identifier for this recording session
+s3Config := &sfu.RecordingOptions{
+    S3Upload:          true,
+    S3Endpoint:        "s3.amazonaws.com",
+    S3AccessKeyID:     "your-access-key",
+    S3SecretAccessKey: "your-secret-key",
+    S3UseSSL:          true,
+    S3BucketName:      "your-bucket",
+    S3BucketPrefix:    "recordings/",
+    DeleteAfterUpload: true,
+}
+err := room.StartRecording(identifier, s3Config)
 if err != nil {
     log.Printf("Failed to start recording: %v", err)
 }
+
+// You can start multiple recording sessions for the same room with different identifiers
+err = room.StartRecording("session-124", s3Config)
 
 // Pause recording
 err = room.PauseRecording()
@@ -56,7 +82,7 @@ if err != nil {
 }
 
 // Resume recording
-err = room.StartRecording() // also used for resuming
+err = room.StartRecording("", nil) // Use empty identifier to resume the current session
 if err != nil {
     log.Printf("Failed to resume recording: %v", err)
 }
@@ -82,7 +108,8 @@ The SFU will fire events related to recording that you can listen for using the 
 room.OnEvent = func(event sfu.Event) {
     switch event.Type {
     case sfu.EventRecordingStart:
-        log.Printf("Recording started for room %s", event.Data["room_id"])
+        log.Printf("Recording started for room %s with identifier %s", 
+            event.Data["room_id"], event.Data["identifier"])
     case sfu.EventRecordingPause:
         log.Printf("Recording paused for room %s", event.Data["room_id"])
     case sfu.EventRecordingResume:
@@ -99,7 +126,7 @@ The recordings are stored in the following structure:
 
 ```
 recordings/
-├── roomId/
+├── [identifier]/
 │   ├── participantId1/
 │   │   ├── track.ogg     (the recorded audio)
 │   │   └── meta.json     (metadata about the recording)
@@ -108,6 +135,11 @@ recordings/
 │   │   └── meta.json
 │   ├── merged.wav        (the merged audio file)
 │   └── merged_metadata.json
+```
+
+When S3 upload is enabled, the merged audio file will be uploaded to:
+```
+s3://[bucket]/[prefix]/[identifier].wav
 ```
 
 ## Metadata
@@ -134,6 +166,7 @@ The merged recording also has a metadata file with information about all partici
 ```json
 {
   "room_id": "room123",
+  "recording_id": "session-123",
   "participants": [
     {
       "participant_id": "participant123",
@@ -155,13 +188,17 @@ The merged recording also has a metadata file with information about all partici
     }
   ],
   "merged_at": "2023-06-01T12:31:00Z",
-  "merged_file": "/path/to/recordings/room123/merged.wav"
+  "merged_file": "/path/to/recordings/session-123/merged.wav",
+  "s3_uploaded": true,
+  "s3_object_name": "recordings/session-123.wav"
 }
 ```
 
 ## Merging Recordings
 
-When a room is closed, the SFU will automatically merge all participant recordings into a single WAV file if `AutoMerge` is set to `true`. The merged file will be stored in the room's directory as `merged.wav`.
+When a room is closed, the SFU will automatically merge all participant recordings into a single WAV file if `AutoMerge` is set to `true`. The merged file will be stored in the recording's directory as `merged.wav`.
+
+If S3 upload is enabled, the merged file will be uploaded to the specified S3 bucket. If `DeleteAfterUpload` is set to `true`, the local files will be deleted after a successful upload.
 
 The merging process takes into account:
 - Start and end times for each participant
@@ -175,4 +212,6 @@ The merging process takes into account:
 - The merged recording is stored in WAV format.
 - The SFU uses FFmpeg for merging recordings, so make sure FFmpeg is installed on your system.
 - For large rooms or long recordings, the merging process might take time and consume resources.
-- Each participant's recording is handled independently, so if a participant leaves and rejoins, they will have multiple recordings. 
+- Each recording session has its own unique identifier, which can be provided when starting a recording.
+- Multiple recording sessions can be created for the same room with different identifiers.
+- S3 upload is performed asynchronously after the recording is stopped and merged. 

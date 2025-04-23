@@ -19,6 +19,16 @@ type RecordingConfig struct {
 	// Default audio parameters
 	DefaultSampleRate   uint32 `json:"default_sample_rate"`
 	DefaultChannelCount uint16 `json:"default_channel_count"`
+	// S3 upload configuration
+	S3Upload       bool   `json:"s3_upload"`
+	S3Endpoint     string `json:"s3_endpoint"`
+	S3AccessKey    string `json:"s3_access_key"`
+	S3SecretKey    string `json:"s3_secret_key"`
+	S3UseSSL       bool   `json:"s3_use_ssl"`
+	S3BucketName   string `json:"s3_bucket_name"`
+	S3BucketPrefix string `json:"s3_bucket_prefix"`
+	// Whether to delete local files after S3 upload
+	DeleteAfterUpload bool `json:"delete_after_upload"`
 }
 
 // ConfigManager manages recording configuration
@@ -35,6 +45,9 @@ func DefaultConfig() RecordingConfig {
 		AutoMerge:           true,
 		DefaultSampleRate:   48000,
 		DefaultChannelCount: 1,
+		S3Upload:            false,
+		S3UseSSL:            true,
+		DeleteAfterUpload:   false,
 	}
 }
 
@@ -78,7 +91,7 @@ func (c *ConfigManager) SaveConfig(configPath string) error {
 	// Create directory if it doesn't exist
 	dir := filepath.Dir(configPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("failed to create config directory: %w", err)
+		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
 	file, err := os.Create(configPath)
@@ -108,13 +121,26 @@ func (c *ConfigManager) UpdateConfig(config RecordingConfig) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Create recordings directory if it doesn't exist or has changed
-	if c.config.RecordingsPath != config.RecordingsPath {
-		if err := os.MkdirAll(config.RecordingsPath, 0755); err != nil {
-			return fmt.Errorf("failed to create recordings directory: %w", err)
-		}
+	// Create recordings directory if it doesn't exist
+	if err := os.MkdirAll(config.RecordingsPath, 0755); err != nil {
+		return fmt.Errorf("failed to create recordings directory: %w", err)
 	}
 
 	c.config = config
 	return nil
+}
+
+// GetS3Credentials returns the S3 credentials from the configuration
+func (c *ConfigManager) GetS3Credentials() S3Credentials {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return S3Credentials{
+		Endpoint:        c.config.S3Endpoint,
+		AccessKeyID:     c.config.S3AccessKey,
+		SecretAccessKey: c.config.S3SecretKey,
+		UseSSL:          c.config.S3UseSSL,
+		BucketName:      c.config.S3BucketName,
+		BucketPrefix:    c.config.S3BucketPrefix,
+	}
 }

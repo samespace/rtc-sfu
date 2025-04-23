@@ -55,6 +55,7 @@ type ParticipantRecorder struct {
 type RoomRecorder struct {
 	mu                 sync.RWMutex
 	roomID             string
+	recordingID        string // Unique identifier for this recording session
 	recordingsPath     string
 	participantRecsMap map[string]*ParticipantRecorder
 	state              RecordingState
@@ -62,11 +63,16 @@ type RoomRecorder struct {
 	cancel             context.CancelFunc
 	audioMerger        *AudioMerger
 	ffmpegPath         string
+	// S3 Upload related fields
+	s3Uploader     *S3Uploader
+	s3Enabled      bool
+	deleteLocal    bool
+	s3BucketPrefix string
 }
 
 // NewRoomRecorder creates a new room recorder
-func NewRoomRecorder(ctx context.Context, roomID, recordingsPath, ffmpegPath string) (*RoomRecorder, error) {
-	roomDirPath := filepath.Join(recordingsPath, roomID)
+func NewRoomRecorder(ctx context.Context, recordingID, recordingsPath, ffmpegPath string) (*RoomRecorder, error) {
+	roomDirPath := filepath.Join(recordingsPath, recordingID)
 	if err := os.MkdirAll(roomDirPath, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create room directory: %w", err)
 	}
@@ -75,7 +81,8 @@ func NewRoomRecorder(ctx context.Context, roomID, recordingsPath, ffmpegPath str
 
 	return &RoomRecorder{
 		mu:                 sync.RWMutex{},
-		roomID:             roomID,
+		roomID:             recordingID,
+		recordingID:        recordingID,
 		recordingsPath:     recordingsPath,
 		participantRecsMap: make(map[string]*ParticipantRecorder),
 		state:              RecordingStateActive,
@@ -83,7 +90,29 @@ func NewRoomRecorder(ctx context.Context, roomID, recordingsPath, ffmpegPath str
 		cancel:             cancel,
 		audioMerger:        NewAudioMerger(ffmpegPath),
 		ffmpegPath:         ffmpegPath,
+		s3Enabled:          false,
+		deleteLocal:        false,
 	}, nil
+}
+
+// SetS3Config configures S3 upload for the recording
+func (r *RoomRecorder) SetS3Config(enabled bool, creds S3Credentials, deleteLocal bool) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.s3Enabled = enabled
+	r.deleteLocal = deleteLocal
+	r.s3BucketPrefix = creds.BucketPrefix
+
+	if enabled {
+		uploader, err := NewS3Uploader(r.ctx, creds)
+		if err != nil {
+			return fmt.Errorf("failed to configure S3 uploader: %w", err)
+		}
+		r.s3Uploader = uploader
+	}
+
+	return nil
 }
 
 // AddParticipant adds a new participant to be recorded
@@ -264,11 +293,32 @@ func (r *RoomRecorder) StopRecording() error {
 		rec.mu.Unlock()
 	}
 
-	// Merge tracks (this should be done in a goroutine to not block)
+	// Merge tracks and upload to S3 if enabled (this should be done in a goroutine to not block)
 	go func() {
+		// Merge the tracks
 		if err := r.mergeParticipantTracks(); err != nil {
 			// Log the error but don't stop processing
 			fmt.Printf("Error merging tracks: %v\n", err)
+			return
+		}
+
+		// Upload to S3 if enabled
+		if r.s3Enabled && r.s3Uploader != nil {
+			outputFile := filepath.Join(r.recordingsPath, r.recordingID, "merged.wav")
+			objectName := fmt.Sprintf("%s.wav", r.recordingID)
+
+			if err := r.s3Uploader.UploadFile(r.ctx, outputFile, objectName); err != nil {
+				fmt.Printf("Error uploading to S3: %v\n", err)
+				return
+			}
+
+			// Clean up local directory if configured to do so
+			if r.deleteLocal {
+				dirPath := filepath.Join(r.recordingsPath, r.recordingID)
+				if err := r.s3Uploader.CleanupDirectory(dirPath); err != nil {
+					fmt.Printf("Error cleaning up local directory: %v\n", err)
+				}
+			}
 		}
 	}()
 
@@ -289,10 +339,10 @@ func (r *RoomRecorder) mergeParticipantTracks() error {
 	r.mu.RUnlock()
 
 	// Create output WAV file path
-	outputFile := filepath.Join(r.recordingsPath, r.roomID, "merged.wav")
+	outputFile := filepath.Join(r.recordingsPath, r.recordingID, "merged.wav")
 
 	// Merge the recordings using AudioMerger
-	roomPath := filepath.Join(r.recordingsPath, r.roomID)
+	roomPath := filepath.Join(r.recordingsPath, r.recordingID)
 	if err := r.audioMerger.MergeParticipantRecordings(roomPath, outputFile); err != nil {
 		return fmt.Errorf("failed to merge participant recordings: %w", err)
 	}
@@ -300,13 +350,17 @@ func (r *RoomRecorder) mergeParticipantTracks() error {
 	// Create merged metadata file
 	mergedMetadata := struct {
 		RoomID       string                `json:"room_id"`
+		RecordingID  string                `json:"recording_id"`
 		Participants []ParticipantMetadata `json:"participants"`
 		MergedAt     time.Time             `json:"merged_at"`
 		MergedFile   string                `json:"merged_file"`
+		S3Uploaded   bool                  `json:"s3_uploaded,omitempty"`
+		S3ObjectName string                `json:"s3_object_name,omitempty"`
 	}{
-		RoomID:     r.roomID,
-		MergedAt:   time.Now(),
-		MergedFile: outputFile,
+		RoomID:      r.roomID,
+		RecordingID: r.recordingID,
+		MergedAt:    time.Now(),
+		MergedFile:  outputFile,
 	}
 
 	r.mu.RLock()
@@ -317,7 +371,17 @@ func (r *RoomRecorder) mergeParticipantTracks() error {
 	}
 	r.mu.RUnlock()
 
-	mergeMetadataPath := filepath.Join(r.recordingsPath, r.roomID, "merged_metadata.json")
+	// If S3 upload is enabled, add S3 info to metadata
+	if r.s3Enabled {
+		mergedMetadata.S3Uploaded = true
+		if r.s3BucketPrefix != "" {
+			mergedMetadata.S3ObjectName = filepath.Join(r.s3BucketPrefix, fmt.Sprintf("%s.wav", r.recordingID))
+		} else {
+			mergedMetadata.S3ObjectName = fmt.Sprintf("%s.wav", r.recordingID)
+		}
+	}
+
+	mergeMetadataPath := filepath.Join(r.recordingsPath, r.recordingID, "merged_metadata.json")
 	return saveMetadata(mergeMetadataPath, mergedMetadata)
 }
 

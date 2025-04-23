@@ -99,16 +99,21 @@ type RoomOptions struct {
 	Recording *RecordingOptions `json:"recording,omitempty"`
 }
 
-// RecordingOptions contains options for room recording
+// RecordingOptions contains options for recording the room
 type RecordingOptions struct {
-	// Whether recording is enabled for this room
-	Enabled bool `json:"enabled"`
-	// Path where recordings will be stored
+	Enabled        bool   `json:"enabled"`
 	RecordingsPath string `json:"recordings_path"`
-	// FFmpeg executable path (optional)
-	FFmpegPath string `json:"ffmpeg_path"`
-	// Auto-merge recordings when room closes
-	AutoMerge bool `json:"auto_merge"`
+	FFmpegPath     string `json:"ffmpeg_path"`
+	AutoMerge      bool   `json:"auto_merge"`
+	// S3 upload configuration
+	S3Upload          bool   `json:"s3_upload"`
+	S3Endpoint        string `json:"s3_endpoint"`
+	S3AccessKeyID     string `json:"s3_access_key_id"`
+	S3SecretAccessKey string `json:"s3_secret_access_key"`
+	S3UseSSL          bool   `json:"s3_use_ssl"`
+	S3BucketName      string `json:"s3_bucket_name"`
+	S3BucketPrefix    string `json:"s3_bucket_prefix"`
+	DeleteAfterUpload bool   `json:"delete_after_upload"`
 }
 
 func DefaultRoomOptions() RoomOptions {
@@ -121,10 +126,13 @@ func DefaultRoomOptions() RoomOptions {
 		PLIInterval:      &pli,
 		EmptyRoomTimeout: &emptyDuration,
 		Recording: &RecordingOptions{
-			Enabled:        false,
-			RecordingsPath: "recordings",
-			FFmpegPath:     "ffmpeg",
-			AutoMerge:      true,
+			Enabled:           false,
+			RecordingsPath:    "recordings",
+			FFmpegPath:        "ffmpeg",
+			AutoMerge:         true,
+			S3Upload:          false,
+			S3UseSSL:          true,
+			DeleteAfterUpload: false,
 		},
 	}
 }
@@ -157,13 +165,34 @@ func newRoom(id, name string, sfu *SFU, kind string, opts RoomOptions) *Room {
 		recordingConfig.RecordingsPath = opts.Recording.RecordingsPath
 		recordingConfig.FFmpegPath = opts.Recording.FFmpegPath
 		recordingConfig.AutoMerge = opts.Recording.AutoMerge
+
+		// Configure S3 settings if enabled
+		if opts.Recording.S3Upload {
+			recordingConfig.S3Upload = true
+			recordingConfig.S3Endpoint = opts.Recording.S3Endpoint
+			recordingConfig.S3AccessKey = opts.Recording.S3AccessKeyID
+			recordingConfig.S3SecretKey = opts.Recording.S3SecretAccessKey
+			recordingConfig.S3UseSSL = opts.Recording.S3UseSSL
+			recordingConfig.S3BucketName = opts.Recording.S3BucketName
+			recordingConfig.S3BucketPrefix = opts.Recording.S3BucketPrefix
+			recordingConfig.DeleteAfterUpload = opts.Recording.DeleteAfterUpload
+		}
+
 		_ = room.recordingConfigMgr.UpdateConfig(recordingConfig)
 
-		// Initialize room recorder
+		// Initialize room recorder using room ID as identifier
 		rec, err := recorder.NewRoomRecorder(localContext, id, recordingConfig.RecordingsPath, recordingConfig.FFmpegPath)
 		if err != nil {
 			sfu.log.Errorf("room: failed to initialize recorder: %v", err)
 		} else {
+			// Configure S3 upload if enabled
+			if recordingConfig.S3Upload {
+				s3Creds := room.recordingConfigMgr.GetS3Credentials()
+				if err := rec.SetS3Config(true, s3Creds, recordingConfig.DeleteAfterUpload); err != nil {
+					sfu.log.Warnf("room: failed to configure S3: %v", err)
+				}
+			}
+
 			room.recorder = rec
 			sfu.log.Infof("room: recording enabled for room %s", id)
 
@@ -220,15 +249,32 @@ func (r *Room) Close() error {
 			r.sfu.log.Infof("room: recording stopped for room %s", r.id)
 
 			if r.OnEvent != nil {
+				eventData := map[string]interface{}{
+					"room_id": r.id,
+				}
+
+				// Check if S3 upload is enabled
+				if r.recordingConfigMgr != nil {
+					config := r.recordingConfigMgr.GetConfig()
+					if config.S3Upload {
+						eventData["s3_upload"] = true
+						eventData["s3_bucket"] = config.S3BucketName
+						if config.S3BucketPrefix != "" {
+							eventData["s3_prefix"] = config.S3BucketPrefix
+						}
+					}
+				}
+
 				r.OnEvent(Event{
 					Type: EventRecordingStop,
 					Time: time.Now(),
-					Data: map[string]interface{}{
-						"room_id": r.id,
-					},
+					Data: eventData,
 				})
 			}
 		}
+
+		r.isRecordingEnabled = false
+		r.recorder = nil
 	}
 
 	r.cancel()
@@ -561,12 +607,17 @@ func (r *Room) loopRecordStats() {
 }
 
 // StartRecording starts recording for the room
-func (r *Room) StartRecording() error {
+func (r *Room) StartRecording(identifier string, s3Config *RecordingOptions) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if r.state == StateRoomClosed {
 		return ErrRoomIsClosed
+	}
+
+	// If identifier is empty, use the room ID
+	if identifier == "" {
+		identifier = r.id
 	}
 
 	if !r.isRecordingEnabled {
@@ -581,12 +632,38 @@ func (r *Room) StartRecording() error {
 			config.AutoMerge = r.options.Recording.AutoMerge
 		}
 
+		// Override with provided S3 configuration if available
+		if s3Config != nil {
+			// Update recording path if provided
+			if s3Config.RecordingsPath != "" {
+				config.RecordingsPath = s3Config.RecordingsPath
+			}
+
+			// Set S3 configuration
+			config.S3Upload = s3Config.S3Upload
+			config.S3Endpoint = s3Config.S3Endpoint
+			config.S3AccessKey = s3Config.S3AccessKeyID
+			config.S3SecretKey = s3Config.S3SecretAccessKey
+			config.S3UseSSL = s3Config.S3UseSSL
+			config.S3BucketName = s3Config.S3BucketName
+			config.S3BucketPrefix = s3Config.S3BucketPrefix
+			config.DeleteAfterUpload = s3Config.DeleteAfterUpload
+		}
+
 		_ = r.recordingConfigMgr.UpdateConfig(config)
 
 		// Create room recorder
-		rec, err := recorder.NewRoomRecorder(r.context, r.id, config.RecordingsPath, config.FFmpegPath)
+		rec, err := recorder.NewRoomRecorder(r.context, identifier, config.RecordingsPath, config.FFmpegPath)
 		if err != nil {
 			return err
+		}
+
+		// Configure S3 upload if enabled
+		if config.S3Upload {
+			s3Creds := r.recordingConfigMgr.GetS3Credentials()
+			if err := rec.SetS3Config(true, s3Creds, config.DeleteAfterUpload); err != nil {
+				r.sfu.log.Warnf("room: failed to configure S3: %v", err)
+			}
 		}
 
 		r.recorder = rec
@@ -646,7 +723,8 @@ func (r *Room) StartRecording() error {
 				Type: EventRecordingStart,
 				Time: time.Now(),
 				Data: map[string]interface{}{
-					"room_id": r.id,
+					"room_id":    r.id,
+					"identifier": identifier,
 				},
 			})
 		}
@@ -715,12 +793,26 @@ func (r *Room) StopRecording() error {
 	r.recorder = nil
 
 	if r.OnEvent != nil {
+		eventData := map[string]interface{}{
+			"room_id": r.id,
+		}
+
+		// Check if S3 upload is enabled
+		if r.recordingConfigMgr != nil {
+			config := r.recordingConfigMgr.GetConfig()
+			if config.S3Upload {
+				eventData["s3_upload"] = true
+				eventData["s3_bucket"] = config.S3BucketName
+				if config.S3BucketPrefix != "" {
+					eventData["s3_prefix"] = config.S3BucketPrefix
+				}
+			}
+		}
+
 		r.OnEvent(Event{
 			Type: EventRecordingStop,
 			Time: time.Now(),
-			Data: map[string]interface{}{
-				"room_id": r.id,
-			},
+			Data: eventData,
 		})
 	}
 

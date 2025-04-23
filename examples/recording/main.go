@@ -99,7 +99,12 @@ func main() {
 
 		// Resume recording after 10 more seconds
 		time.Sleep(10 * time.Second)
-		if err := room.StartRecording(); err != nil {
+		if err := room.StartRecording(roomID, &sfu.RecordingOptions{
+			Enabled:        true,
+			RecordingsPath: "recordings",
+			FFmpegPath:     "ffmpeg",
+			AutoMerge:      true,
+		}); err != nil {
 			log.Printf("Failed to resume recording: %v", err)
 		} else {
 			log.Println("Recording resumed")
