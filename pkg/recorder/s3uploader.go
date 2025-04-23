@@ -158,6 +158,45 @@ func (u *S3Uploader) UploadFile(localPath, identifier string) error {
 	}
 }
 
+// UploadSingleFile uploads only the specified file to S3
+func (u *S3Uploader) UploadSingleFile(localPath, identifier, targetFileName string) error {
+	if !u.config.Enabled {
+		return fmt.Errorf("s3 upload not enabled")
+	}
+
+	// Use the target filename if provided, otherwise use the original filename
+	fileName := targetFileName
+	if fileName == "" {
+		fileName = filepath.Base(localPath)
+	}
+
+	s3Key := fileName
+	if u.config.KeyPrefix != "" {
+		prefix := u.config.KeyPrefix
+		if !strings.HasSuffix(prefix, "/") {
+			prefix = prefix + "/"
+		}
+		s3Key = prefix + s3Key
+	}
+
+	// Add identifier to key path if provided
+	if identifier != "" {
+		s3Key = filepath.Join(identifier, s3Key)
+	}
+
+	// Queue the upload task
+	select {
+	case u.uploadQueue <- uploadTask{
+		localPath:  localPath,
+		s3Key:      s3Key,
+		identifier: identifier,
+	}:
+		return nil
+	case <-u.ctx.Done():
+		return fmt.Errorf("uploader is shutting down")
+	}
+}
+
 // UploadDirectory uploads all files in a directory to S3
 func (u *S3Uploader) UploadDirectory(dirPath, identifier string) error {
 	return filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
@@ -197,6 +236,18 @@ func (u *S3Uploader) UploadDirectory(dirPath, identifier string) error {
 		}
 		return nil
 	})
+}
+
+// UploadMergedFile uploads only the merged.wav file with the specified name
+func (u *S3Uploader) UploadMergedFile(dirPath, identifier, targetFileName string) error {
+	mergedFilePath := filepath.Join(dirPath, "merged.wav")
+
+	// Check if the merged file exists
+	if _, err := os.Stat(mergedFilePath); os.IsNotExist(err) {
+		return fmt.Errorf("merged file does not exist: %s", mergedFilePath)
+	}
+
+	return u.UploadSingleFile(mergedFilePath, identifier, targetFileName)
 }
 
 // GetUploadStatus returns the status of a specific upload

@@ -2,6 +2,7 @@ package sfu
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -612,13 +613,19 @@ func (r *Room) loopRecordStats() {
 	}
 }
 
-// StartRecording starts recording for the room with an optional custom recording ID
-func (r *Room) StartRecording(recordingID string) error {
+// StartRecording starts recording for the room with an optional custom recording ID and base path
+func (r *Room) StartRecording(recordingID string, options ...map[string]string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if r.state == StateRoomClosed {
 		return ErrRoomIsClosed
+	}
+
+	// Process options if provided
+	var basePath string
+	if len(options) > 0 && options[0] != nil {
+		basePath = options[0]["basePath"]
 	}
 
 	// If no recording ID is provided, generate a unique one
@@ -648,12 +655,32 @@ func (r *Room) StartRecording(recordingID string) error {
 
 		// Configure S3 upload if enabled
 		if r.options.Recording != nil && r.options.Recording.S3Upload != nil && r.options.Recording.S3Upload.Enabled {
+			// Apply base path if provided
+			keyPrefix := r.options.Recording.S3Upload.KeyPrefix
+			if basePath != "" {
+				// Ensure the base path has a trailing slash if not empty
+				if !strings.HasSuffix(basePath, "/") {
+					basePath = basePath + "/"
+				}
+
+				// If keyPrefix is empty, use only basePath
+				if keyPrefix == "" {
+					keyPrefix = basePath
+				} else {
+					// Ensure keyPrefix has a trailing slash if not empty
+					if !strings.HasSuffix(keyPrefix, "/") {
+						keyPrefix = keyPrefix + "/"
+					}
+					keyPrefix = basePath + keyPrefix
+				}
+			}
+
 			s3Config := &recorder.S3UploadConfig{
 				Enabled:           r.options.Recording.S3Upload.Enabled,
 				BucketName:        r.options.Recording.S3Upload.BucketName,
 				Endpoint:          r.options.Recording.S3Upload.Endpoint,
 				Region:            r.options.Recording.S3Upload.Region,
-				KeyPrefix:         r.options.Recording.S3Upload.KeyPrefix,
+				KeyPrefix:         keyPrefix,
 				AccessKeyID:       r.options.Recording.S3Upload.AccessKeyID,
 				SecretAccessKey:   r.options.Recording.S3Upload.SecretAccessKey,
 				UseSSL:            r.options.Recording.S3Upload.UseSSL,

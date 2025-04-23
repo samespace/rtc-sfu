@@ -68,6 +68,13 @@ if err != nil {
     log.Printf("Failed to resume recording: %v", err)
 }
 
+// Start recording with a specific base path for S3 upload (e.g., debug folder)
+options := map[string]string{"basePath": "debug/"}
+err = room.StartRecording(recordingID, options)
+if err != nil {
+    log.Printf("Failed to start recording with custom base path: %v", err)
+}
+
 // Stop recording
 err = room.StopRecording()
 if err != nil {

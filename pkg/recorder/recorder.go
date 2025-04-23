@@ -253,13 +253,13 @@ func (r *RoomRecorder) ResumeRecording() error {
 	return nil
 }
 
-// StopRecording stops recording for the entire room and merges tracks
+// StopRecording stops all participant recorders and merges the recordings
 func (r *RoomRecorder) StopRecording() error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	if r.state == RecordingStateStopped {
-		return nil // Already stopped
+		r.mu.Unlock()
+		return nil
 	}
 
 	r.state = RecordingStateStopped
@@ -267,14 +267,16 @@ func (r *RoomRecorder) StopRecording() error {
 	// Stop all participant recorders
 	for _, rec := range r.participantRecsMap {
 		rec.mu.Lock()
-
-		// Set end time in metadata
-		now := time.Now()
-		rec.metadata.EndTime = &now
+		// Set end time if not already set
+		if rec.metadata.EndTime == nil {
+			now := time.Now()
+			rec.metadata.EndTime = &now
+		}
 
 		// If recording was paused, also end the last pause period
 		if rec.state == RecordingStatePaused && len(rec.metadata.PausedPeriods) > 0 {
 			lastIdx := len(rec.metadata.PausedPeriods) - 1
+			now := time.Now()
 			rec.metadata.PausedPeriods[lastIdx].End = &now
 		}
 
@@ -307,9 +309,6 @@ func (r *RoomRecorder) StopRecording() error {
 		if r.s3Uploader != nil {
 			r.autoUploadToS3 = true // Ensure auto-upload is enabled
 
-			// Don't force DeleteAfterUpload to true, respect original configuration
-			// This ensures files are only deleted after successful upload but kept if upload fails
-
 			roomDir := filepath.Join(r.recordingsPath, r.roomID)
 
 			// Create a new S3Uploader with the background context instead of using the one
@@ -323,15 +322,26 @@ func (r *RoomRecorder) StopRecording() error {
 			}
 			defer uploader.Close()
 
-			if err := uploader.UploadDirectory(roomDir, r.roomID); err != nil {
-				fmt.Printf("Error uploading recordings to S3: %v\n", err)
+			// Upload only the merged file with the name as the recording ID
+			if err := uploader.UploadMergedFile(roomDir, r.roomID, r.roomID+".wav"); err != nil {
+				fmt.Printf("Error uploading merged recording to S3: %v\n", err)
 			} else {
-				fmt.Printf("Successfully uploaded recordings for room %s to S3\n", r.roomID)
+				fmt.Printf("Successfully uploaded merged recording for room %s to S3\n", r.roomID)
+
+				// If delete after upload is enabled, delete the local directory
+				if r.s3Uploader.config.DeleteAfterUpload {
+					if err := os.RemoveAll(roomDir); err != nil {
+						fmt.Printf("Error deleting recordings directory: %v\n", err)
+					} else {
+						fmt.Printf("Successfully deleted recordings directory for room %s\n", r.roomID)
+					}
+				}
 			}
 		}
 	}()
 
 	r.cancel()
+	r.mu.Unlock()
 	return nil
 }
 
