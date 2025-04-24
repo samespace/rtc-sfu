@@ -338,18 +338,20 @@ func (r *Room) AddClient(id, name string, opts ClientOptions) (*Client, error) {
 				}
 
 				// Add participant to recording
-				if err := r.recorder.AddParticipant(client.ID(), track.ID(), sampleRate, channelCount); err != nil {
-					r.sfu.log.Errorf("room: failed to add participant to recording: %v", err)
-					return
-				}
-
-				// Set up RTP packet interception for recording
-				track.OnRead(func(attrs interceptor.Attributes, packet *rtp.Packet, quality QualityLevel) {
-					if err := r.recorder.WriteRTP(client.ID(), packet); err != nil {
-						// Only log this at debug level to avoid flooding logs
-						r.sfu.log.Debugf("room: failed to write RTP packet: %v", err)
+				if r.recorder != nil {
+					if err := r.recorder.AddParticipant(client.ID(), track.ID(), sampleRate, channelCount); err != nil {
+						r.sfu.log.Errorf("room: failed to add participant to recording: %v", err)
+						return
 					}
-				})
+
+					// Set up RTP packet interception for recording
+					track.OnRead(func(attrs interceptor.Attributes, packet *rtp.Packet, quality QualityLevel) {
+						if err := r.recorder.WriteRTP(client.ID(), packet); err != nil {
+							// Only log this at debug level to avoid flooding logs
+							r.sfu.log.Debugf("room: failed to write RTP packet: %v", err)
+						}
+					})
+				}
 			}
 		}
 	}
