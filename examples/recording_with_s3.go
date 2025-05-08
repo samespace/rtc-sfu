@@ -74,7 +74,7 @@ func main() {
 	}
 
 	// Start recording with the configuration
-	if err := room.StartRecording(recordingID, s3Config); err != nil {
+	if err := room.StartRecording(recordingID, s3Config, nil); err != nil {
 		log.Fatalf("Failed to start recording: %v", err)
 	}
 

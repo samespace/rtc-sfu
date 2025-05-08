@@ -76,9 +76,10 @@ type Room struct {
 	OnEvent                 func(event Event)
 	options                 RoomOptions
 	// Recording related fields
-	recorder           *recorder.RoomRecorder
-	recordingConfigMgr *recorder.ConfigManager
-	isRecordingEnabled bool
+	recorder                   *recorder.RoomRecorder
+	recordingConfigMgr         *recorder.ConfigManager
+	isRecordingEnabled         bool
+	recordingParticipantFilter []string
 }
 
 type RoomOptions struct {
@@ -309,6 +310,20 @@ func (r *Room) AddClient(id, name string, opts ClientOptions) (*Client, error) {
 	// Set up recording for the client audio tracks if recording is enabled
 	if r.isRecordingEnabled && r.recorder != nil {
 		client.onTrack = func(track ITrack) {
+			// If we have a participants filter and this client is not in the list, don't record
+			if r.recordingParticipantFilter != nil && len(r.recordingParticipantFilter) > 0 {
+				found := false
+				for _, id := range r.recordingParticipantFilter {
+					if client.ID() == id {
+						found = true
+						break
+					}
+				}
+				if !found {
+					return // Don't record this client
+				}
+			}
+
 			if track.Kind() == webrtc.RTPCodecTypeAudio {
 				// Use type switch to handle both Track and AudioTrack types
 				var codecParams webrtc.RTPCodecParameters
@@ -547,7 +562,7 @@ func (r *Room) loopRecordStats() {
 }
 
 // StartRecording starts recording for the room
-func (r *Room) StartRecording(identifier string, s3Config *RecordingOptions) error {
+func (r *Room) StartRecording(identifier string, s3Config *RecordingOptions, participantIDs []string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -564,6 +579,9 @@ func (r *Room) StartRecording(identifier string, s3Config *RecordingOptions) err
 		// Initialize recording config
 		r.recordingConfigMgr = recorder.NewConfigManager()
 		config := r.recordingConfigMgr.GetConfig()
+
+		// Store the participant filter for future clients that join during recording
+		r.recordingParticipantFilter = participantIDs
 
 		// Set default configuration
 		config.RecordingsPath = "recordings"
@@ -620,6 +638,20 @@ func (r *Room) StartRecording(identifier string, s3Config *RecordingOptions) err
 		// Add all existing clients to the recorder
 		clients := r.sfu.GetClients()
 		for _, client := range clients {
+			// Skip clients not in the participantIDs list if specific participants are provided
+			if len(participantIDs) > 0 {
+				found := false
+				for _, id := range participantIDs {
+					if client.ID() == id {
+						found = true
+						break
+					}
+				}
+				if !found {
+					continue // Skip this client as it's not in the list
+				}
+			}
+
 			for _, track := range client.Tracks() {
 				if track.Kind() == webrtc.RTPCodecTypeAudio {
 					// Use type switch to handle both Track and AudioTrack types
@@ -667,13 +699,21 @@ func (r *Room) StartRecording(identifier string, s3Config *RecordingOptions) err
 		}
 
 		if r.OnEvent != nil {
+			eventData := map[string]interface{}{
+				"room_id":    r.id,
+				"identifier": identifier,
+			}
+
+			// Add information about specific participants if applicable
+			if participantIDs != nil && len(participantIDs) > 0 {
+				eventData["specific_participants"] = true
+				eventData["participant_ids"] = participantIDs
+			}
+
 			r.OnEvent(Event{
 				Type: EventRecordingStart,
 				Time: time.Now(),
-				Data: map[string]interface{}{
-					"room_id":    r.id,
-					"identifier": identifier,
-				},
+				Data: eventData,
 			})
 		}
 	} else if r.recorder != nil {
@@ -739,6 +779,7 @@ func (r *Room) StopRecording() error {
 
 	r.isRecordingEnabled = false
 	r.recorder = nil
+	r.recordingParticipantFilter = nil
 
 	if r.OnEvent != nil {
 		eventData := map[string]interface{}{
