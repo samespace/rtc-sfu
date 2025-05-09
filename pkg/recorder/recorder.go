@@ -37,7 +37,7 @@ type ParticipantMetadata struct {
 	} `json:"paused_periods,omitempty"`
 }
 
-// ParticipantRecorder handles recording for a single participant
+// ParticipantRecorder handles recording for a single track
 type ParticipantRecorder struct {
 	mu            sync.Mutex
 	writer        *oggwriter.OggWriter
@@ -57,7 +57,7 @@ type RoomRecorder struct {
 	roomID             string
 	recordingID        string // Unique identifier for this recording session
 	recordingsPath     string
-	participantRecsMap map[string]*ParticipantRecorder
+	participantRecsMap map[string]map[string]*ParticipantRecorder // map[participantID]map[trackID]*ParticipantRecorder
 	state              RecordingState
 	ctx                context.Context
 	cancel             context.CancelFunc
@@ -72,9 +72,9 @@ type RoomRecorder struct {
 
 // NewRoomRecorder creates a new room recorder
 func NewRoomRecorder(ctx context.Context, recordingID, recordingsPath, ffmpegPath string) (*RoomRecorder, error) {
-	roomDirPath := filepath.Join(recordingsPath, recordingID)
-	if err := os.MkdirAll(roomDirPath, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create room directory: %w", err)
+	// Create recordings directory if it doesn't exist
+	if err := os.MkdirAll(recordingsPath, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create recordings directory: %w", err)
 	}
 
 	recCtx, cancel := context.WithCancel(ctx)
@@ -84,14 +84,12 @@ func NewRoomRecorder(ctx context.Context, recordingID, recordingsPath, ffmpegPat
 		roomID:             recordingID,
 		recordingID:        recordingID,
 		recordingsPath:     recordingsPath,
-		participantRecsMap: make(map[string]*ParticipantRecorder),
+		participantRecsMap: make(map[string]map[string]*ParticipantRecorder),
 		state:              RecordingStateActive,
 		ctx:                recCtx,
 		cancel:             cancel,
 		audioMerger:        NewAudioMerger(ffmpegPath),
 		ffmpegPath:         ffmpegPath,
-		s3Enabled:          false,
-		deleteLocal:        false,
 	}, nil
 }
 
@@ -115,14 +113,19 @@ func (r *RoomRecorder) SetS3Config(enabled bool, creds S3Credentials, deleteLoca
 	return nil
 }
 
-// AddParticipant adds a new participant to be recorded
+// AddParticipant adds a new participant track to be recorded
 func (r *RoomRecorder) AddParticipant(participantID, trackID string, sampleRate uint32, channelCount uint16) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// Check if participant already exists
-	if _, exists := r.participantRecsMap[participantID]; exists {
-		return fmt.Errorf("participant %s already being recorded", participantID)
+	// Check if participant exists in the map, if not create a new entry
+	if _, exists := r.participantRecsMap[participantID]; !exists {
+		r.participantRecsMap[participantID] = make(map[string]*ParticipantRecorder)
+	}
+
+	// Check if this specific track is already being recorded
+	if _, exists := r.participantRecsMap[participantID][trackID]; exists {
+		return fmt.Errorf("track %s for participant %s already being recorded", trackID, participantID)
 	}
 
 	// Create participant directory
@@ -131,14 +134,14 @@ func (r *RoomRecorder) AddParticipant(participantID, trackID string, sampleRate 
 		return fmt.Errorf("failed to create participant directory: %w", err)
 	}
 
-	// Create OGG writer
-	audioFilePath := filepath.Join(participantDirPath, "track.ogg")
+	// Create OGG writer with track ID in the filename
+	audioFilePath := filepath.Join(participantDirPath, fmt.Sprintf("track_%s.ogg", trackID))
 	oggWriter, err := oggwriter.New(audioFilePath, sampleRate, channelCount)
 	if err != nil {
 		return fmt.Errorf("failed to create ogg writer: %w", err)
 	}
 
-	metadataPath := filepath.Join(participantDirPath, "meta.json")
+	metadataPath := filepath.Join(participantDirPath, fmt.Sprintf("meta_%s.json", trackID))
 
 	recCtx, cancel := context.WithCancel(r.ctx)
 
@@ -155,7 +158,7 @@ func (r *RoomRecorder) AddParticipant(participantID, trackID string, sampleRate 
 		return fmt.Errorf("failed to save metadata: %w", err)
 	}
 
-	r.participantRecsMap[participantID] = &ParticipantRecorder{
+	r.participantRecsMap[participantID][trackID] = &ParticipantRecorder{
 		mu:            sync.Mutex{},
 		writer:        oggWriter,
 		metadataPath:  metadataPath,
@@ -171,23 +174,33 @@ func (r *RoomRecorder) AddParticipant(participantID, trackID string, sampleRate 
 	return nil
 }
 
-// WriteRTP writes an RTP packet for a specific participant
+// WriteRTP writes an RTP packet for a specific participant track
 func (r *RoomRecorder) WriteRTP(participantID string, packet *rtp.Packet) error {
 	r.mu.RLock()
-	recorder, exists := r.participantRecsMap[participantID]
+	participantMap, exists := r.participantRecsMap[participantID]
 	r.mu.RUnlock()
 
-	if !exists {
+	if !exists || len(participantMap) == 0 {
 		return fmt.Errorf("participant %s not found", participantID)
 	}
 
-	recorder.mu.Lock()
-	defer recorder.mu.Unlock()
-
-	// Only write if recording is active
-	if recorder.state == RecordingStateActive {
-		recorder.lastTimestamp = time.Now()
-		return recorder.writer.WriteRTP(packet)
+	// Write to all tracks for this participant
+	// This assumes the packet's SSRC or another property could identify which track it belongs to
+	// For now, just write to all tracks
+	for trackID, recorder := range participantMap {
+		recorder.mu.Lock()
+		// Only write if recording is active
+		if recorder.state == RecordingStateActive {
+			recorder.lastTimestamp = time.Now()
+			err := recorder.writer.WriteRTP(packet)
+			recorder.mu.Unlock()
+			if err != nil {
+				// Just log errors and continue
+				fmt.Printf("error writing RTP packet to track %s: %v\n", trackID, err)
+			}
+		} else {
+			recorder.mu.Unlock()
+		}
 	}
 
 	return nil
@@ -205,21 +218,23 @@ func (r *RoomRecorder) PauseRecording() error {
 	r.state = RecordingStatePaused
 
 	// Pause all participant recorders
-	for _, rec := range r.participantRecsMap {
-		rec.mu.Lock()
-		if rec.state == RecordingStateActive {
-			rec.state = RecordingStatePaused
-			pausePeriod := struct {
-				Start time.Time  `json:"start"`
-				End   *time.Time `json:"end,omitempty"`
-			}{
-				Start: time.Now(),
+	for _, participantMap := range r.participantRecsMap {
+		for _, rec := range participantMap {
+			rec.mu.Lock()
+			if rec.state == RecordingStateActive {
+				rec.state = RecordingStatePaused
+				pausePeriod := struct {
+					Start time.Time  `json:"start"`
+					End   *time.Time `json:"end,omitempty"`
+				}{
+					Start: time.Now(),
+				}
+				rec.metadata.PausedPeriods = append(rec.metadata.PausedPeriods, pausePeriod)
+				// Update metadata
+				saveMetadata(rec.metadataPath, rec.metadata)
 			}
-			rec.metadata.PausedPeriods = append(rec.metadata.PausedPeriods, pausePeriod)
-			// Update metadata
-			saveMetadata(rec.metadataPath, rec.metadata)
+			rec.mu.Unlock()
 		}
-		rec.mu.Unlock()
 	}
 
 	return nil
@@ -237,18 +252,20 @@ func (r *RoomRecorder) ResumeRecording() error {
 	r.state = RecordingStateActive
 
 	// Resume all participant recorders
-	for _, rec := range r.participantRecsMap {
-		rec.mu.Lock()
-		if rec.state == RecordingStatePaused && len(rec.metadata.PausedPeriods) > 0 {
-			rec.state = RecordingStateActive
-			// Update the end time of the last pause period
-			lastIdx := len(rec.metadata.PausedPeriods) - 1
-			now := time.Now()
-			rec.metadata.PausedPeriods[lastIdx].End = &now
-			// Update metadata
-			saveMetadata(rec.metadataPath, rec.metadata)
+	for _, participantMap := range r.participantRecsMap {
+		for _, rec := range participantMap {
+			rec.mu.Lock()
+			if rec.state == RecordingStatePaused && len(rec.metadata.PausedPeriods) > 0 {
+				rec.state = RecordingStateActive
+				// Update the end time of the last pause period
+				lastIdx := len(rec.metadata.PausedPeriods) - 1
+				now := time.Now()
+				rec.metadata.PausedPeriods[lastIdx].End = &now
+				// Update metadata
+				saveMetadata(rec.metadataPath, rec.metadata)
+			}
+			rec.mu.Unlock()
 		}
-		rec.mu.Unlock()
 	}
 
 	return nil
@@ -282,36 +299,41 @@ func (r *RoomRecorder) StopRecording() error {
 		writer       *oggwriter.OggWriter
 	}
 
-	participantsCopy := make(map[string]participantData)
+	participantsCopy := make(map[string]map[string]participantData)
 
 	// Stop all participant recorders and gather their data
-	for id, rec := range r.participantRecsMap {
-		rec.mu.Lock()
-
-		// Set end time in metadata
-		now := time.Now()
-		rec.metadata.EndTime = &now
-
-		// If recording was paused, also end the last pause period
-		if rec.state == RecordingStatePaused && len(rec.metadata.PausedPeriods) > 0 {
-			lastIdx := len(rec.metadata.PausedPeriods) - 1
-			rec.metadata.PausedPeriods[lastIdx].End = &now
+	for participantID, trackMap := range r.participantRecsMap {
+		if _, exists := participantsCopy[participantID]; !exists {
+			participantsCopy[participantID] = make(map[string]participantData)
 		}
+		for trackID, rec := range trackMap {
+			rec.mu.Lock()
 
-		// Copy metadata
-		participantsCopy[id] = participantData{
-			metadata:     rec.metadata,
-			metadataPath: rec.metadataPath,
-			writer:       rec.writer,
+			// Set end time in metadata
+			now := time.Now()
+			rec.metadata.EndTime = &now
+
+			// If recording was paused, also end the last pause period
+			if rec.state == RecordingStatePaused && len(rec.metadata.PausedPeriods) > 0 {
+				lastIdx := len(rec.metadata.PausedPeriods) - 1
+				rec.metadata.PausedPeriods[lastIdx].End = &now
+			}
+
+			// Copy metadata
+			participantsCopy[participantID][trackID] = participantData{
+				metadata:     rec.metadata,
+				metadataPath: rec.metadataPath,
+				writer:       rec.writer,
+			}
+
+			// Update original metadata
+			saveMetadata(rec.metadataPath, rec.metadata)
+
+			// Mark as stopped
+			rec.state = RecordingStateStopped
+			rec.cancel()
+			rec.mu.Unlock()
 		}
-
-		// Update original metadata
-		saveMetadata(rec.metadataPath, rec.metadata)
-
-		// Mark as stopped
-		rec.state = RecordingStateStopped
-		rec.cancel()
-		rec.mu.Unlock()
 	}
 
 	// Create a background context that won't be canceled
@@ -324,9 +346,11 @@ func (r *RoomRecorder) StopRecording() error {
 	// Process everything asynchronously
 	go func() {
 		// First, close all writers (outside of locks)
-		for _, participant := range participantsCopy {
-			if err := participant.writer.Close(); err != nil {
-				fmt.Printf("Error closing writer: %v\n", err)
+		for _, trackMap := range participantsCopy {
+			for _, participant := range trackMap {
+				if err := participant.writer.Close(); err != nil {
+					fmt.Printf("Error closing writer: %v\n", err)
+				}
 			}
 		}
 
@@ -360,8 +384,10 @@ func (r *RoomRecorder) StopRecording() error {
 		}
 
 		// Add participant data to metadata
-		for _, participant := range participantsCopy {
-			mergedMetadata.Participants = append(mergedMetadata.Participants, participant.metadata)
+		for _, trackMap := range participantsCopy {
+			for _, participant := range trackMap {
+				mergedMetadata.Participants = append(mergedMetadata.Participants, participant.metadata)
+			}
 		}
 
 		// Add S3 info to metadata if enabled
@@ -416,45 +442,52 @@ func saveMetadata(path string, data interface{}) error {
 	return encoder.Encode(data)
 }
 
-// RemoveParticipant removes a participant recorder
+// RemoveParticipant removes a participant from recording
 func (r *RoomRecorder) RemoveParticipant(participantID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	rec, exists := r.participantRecsMap[participantID]
+	trackMap, exists := r.participantRecsMap[participantID]
 	if !exists {
 		return fmt.Errorf("participant %s not found", participantID)
 	}
 
-	rec.mu.Lock()
-	defer rec.mu.Unlock()
+	// Stop all tracks for this participant
+	for _, rec := range trackMap {
+		rec.mu.Lock()
 
-	// Set end time if not already set
-	if rec.metadata.EndTime == nil {
-		now := time.Now()
-		rec.metadata.EndTime = &now
+		// Set end time if not already set
+		if rec.metadata.EndTime == nil {
+			now := time.Now()
+			rec.metadata.EndTime = &now
 
-		// If paused, end the last pause period
-		if rec.state == RecordingStatePaused && len(rec.metadata.PausedPeriods) > 0 {
-			lastIdx := len(rec.metadata.PausedPeriods) - 1
-			rec.metadata.PausedPeriods[lastIdx].End = &now
+			// If paused, end the last pause period
+			if rec.state == RecordingStatePaused && len(rec.metadata.PausedPeriods) > 0 {
+				lastIdx := len(rec.metadata.PausedPeriods) - 1
+				rec.metadata.PausedPeriods[lastIdx].End = &now
+			}
 		}
-	}
 
-	// Update metadata
-	if err := saveMetadata(rec.metadataPath, rec.metadata); err != nil {
-		return fmt.Errorf("failed to save metadata: %w", err)
-	}
+		// Update metadata
+		if err := saveMetadata(rec.metadataPath, rec.metadata); err != nil {
+			rec.mu.Unlock()
+			return fmt.Errorf("failed to save metadata: %w", err)
+		}
 
-	// Close writer
-	if err := rec.writer.Close(); err != nil {
-		return fmt.Errorf("failed to close writer: %w", err)
-	}
+		// Close writer
+		if err := rec.writer.Close(); err != nil {
+			rec.mu.Unlock()
+			return fmt.Errorf("failed to close writer: %w", err)
+		}
 
-	rec.state = RecordingStateStopped
-	rec.cancel()
+		// Mark as stopped
+		rec.state = RecordingStateStopped
+		rec.cancel()
+		rec.mu.Unlock()
+	}
 
 	delete(r.participantRecsMap, participantID)
+
 	return nil
 }
 
