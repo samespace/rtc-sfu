@@ -176,7 +176,7 @@ func (r *RoomRecorder) AddParticipant(participantID, trackID string, sampleRate 
 
 // WriteRTP writes an RTP packet for a specific participant track
 func (r *RoomRecorder) WriteRTP(participantID string, packet *rtp.Packet) error {
-	// Guard against nil recorder
+	// Guard against nil recorder - must check before any method calls on r
 	if r == nil {
 		return fmt.Errorf("recorder is nil")
 	}
@@ -189,16 +189,27 @@ func (r *RoomRecorder) WriteRTP(participantID string, packet *rtp.Packet) error 
 	}
 
 	participantMap, exists := r.participantRecsMap[participantID]
-	r.mu.RUnlock()
-
 	if !exists || len(participantMap) == 0 {
+		r.mu.RUnlock()
 		return fmt.Errorf("participant %s not found", participantID)
 	}
+
+	// Create a local copy of the participant map to avoid holding the lock
+	// while writing to the participants
+	trackRecorders := make(map[string]*ParticipantRecorder)
+	for trackID, recorder := range participantMap {
+		trackRecorders[trackID] = recorder
+	}
+	r.mu.RUnlock()
 
 	// Write to all tracks for this participant
 	// This assumes the packet's SSRC or another property could identify which track it belongs to
 	// For now, just write to all tracks
-	for trackID, recorder := range participantMap {
+	for trackID, recorder := range trackRecorders {
+		if recorder == nil {
+			continue // Skip nil recorders
+		}
+
 		recorder.mu.Lock()
 		// Only write if recording is active
 		if recorder.state == RecordingStateActive {
@@ -219,6 +230,10 @@ func (r *RoomRecorder) WriteRTP(participantID string, packet *rtp.Packet) error 
 
 // PauseRecording pauses recording for the entire room
 func (r *RoomRecorder) PauseRecording() error {
+	if r == nil {
+		return fmt.Errorf("recorder is nil")
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -231,6 +246,10 @@ func (r *RoomRecorder) PauseRecording() error {
 	// Pause all participant recorders
 	for _, participantMap := range r.participantRecsMap {
 		for _, rec := range participantMap {
+			if rec == nil {
+				continue
+			}
+
 			rec.mu.Lock()
 			if rec.state == RecordingStateActive {
 				rec.state = RecordingStatePaused
@@ -253,6 +272,10 @@ func (r *RoomRecorder) PauseRecording() error {
 
 // ResumeRecording resumes recording for the entire room
 func (r *RoomRecorder) ResumeRecording() error {
+	if r == nil {
+		return fmt.Errorf("recorder is nil")
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -265,6 +288,10 @@ func (r *RoomRecorder) ResumeRecording() error {
 	// Resume all participant recorders
 	for _, participantMap := range r.participantRecsMap {
 		for _, rec := range participantMap {
+			if rec == nil {
+				continue
+			}
+
 			rec.mu.Lock()
 			if rec.state == RecordingStatePaused && len(rec.metadata.PausedPeriods) > 0 {
 				rec.state = RecordingStateActive
@@ -284,6 +311,10 @@ func (r *RoomRecorder) ResumeRecording() error {
 
 // StopRecording stops recording for the entire room and merges tracks
 func (r *RoomRecorder) StopRecording() error {
+	if r == nil {
+		return fmt.Errorf("recorder is nil")
+	}
+
 	r.mu.Lock()
 
 	if r.state == RecordingStateStopped {
@@ -318,6 +349,10 @@ func (r *RoomRecorder) StopRecording() error {
 			participantsCopy[participantID] = make(map[string]participantData)
 		}
 		for trackID, rec := range trackMap {
+			if rec == nil {
+				continue
+			}
+
 			rec.mu.Lock()
 
 			// Set end time in metadata
@@ -359,8 +394,10 @@ func (r *RoomRecorder) StopRecording() error {
 		// First, close all writers (outside of locks)
 		for _, trackMap := range participantsCopy {
 			for _, participant := range trackMap {
-				if err := participant.writer.Close(); err != nil {
-					fmt.Printf("Error closing writer: %v\n", err)
+				if participant.writer != nil {
+					if err := participant.writer.Close(); err != nil {
+						fmt.Printf("Error closing writer: %v\n", err)
+					}
 				}
 			}
 		}
@@ -424,14 +461,14 @@ func (r *RoomRecorder) StopRecording() error {
 			// We use the background context for upload to ensure it's not cancelled
 			if err := s3Uploader.UploadFile(bgCtx, outputFile, objectName); err != nil {
 				fmt.Printf("Error uploading to S3: %v\n", err)
-				return
-			}
-
-			// Clean up local directory if configured to do so
-			if deleteLocal {
-				dirPath := filepath.Join(recordingsPath, recordingID)
-				if err := s3Uploader.CleanupDirectory(dirPath); err != nil {
-					fmt.Printf("Error cleaning up local directory: %v\n", err)
+				// Continue with cleanup even if upload fails
+			} else {
+				// Clean up local directory if configured to do so and upload was successful
+				if deleteLocal {
+					dirPath := filepath.Join(recordingsPath, recordingID)
+					if err := s3Uploader.CleanupDirectory(dirPath); err != nil {
+						fmt.Printf("Error cleaning up local directory: %v\n", err)
+					}
 				}
 			}
 		}
@@ -455,6 +492,10 @@ func saveMetadata(path string, data interface{}) error {
 
 // RemoveParticipant removes a participant from recording
 func (r *RoomRecorder) RemoveParticipant(participantID string) error {
+	if r == nil {
+		return fmt.Errorf("recorder is nil")
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -464,7 +505,11 @@ func (r *RoomRecorder) RemoveParticipant(participantID string) error {
 	}
 
 	// Stop all tracks for this participant
-	for _, rec := range trackMap {
+	for trackID, rec := range trackMap {
+		if rec == nil {
+			continue
+		}
+
 		rec.mu.Lock()
 
 		// Set end time if not already set
@@ -482,13 +527,15 @@ func (r *RoomRecorder) RemoveParticipant(participantID string) error {
 		// Update metadata
 		if err := saveMetadata(rec.metadataPath, rec.metadata); err != nil {
 			rec.mu.Unlock()
-			return fmt.Errorf("failed to save metadata: %w", err)
+			fmt.Printf("Failed to save metadata for participant %s track %s: %v\n", participantID, trackID, err)
 		}
 
 		// Close writer
-		if err := rec.writer.Close(); err != nil {
-			rec.mu.Unlock()
-			return fmt.Errorf("failed to close writer: %w", err)
+		if rec.writer != nil {
+			if err := rec.writer.Close(); err != nil {
+				rec.mu.Unlock()
+				fmt.Printf("Failed to close writer for participant %s track %s: %v\n", participantID, trackID, err)
+			}
 		}
 
 		// Mark as stopped
