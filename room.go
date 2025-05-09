@@ -803,12 +803,18 @@ func (r *Room) StopRecording() error {
 		return nil // Nothing to stop
 	}
 
+	// First stop the recorder (this sets its state to stopped)
 	if err := r.recorder.StopRecording(); err != nil {
 		return err
 	}
 
+	// We delay nullifying the recorder to allow any in-flight RTP packets to be processed
+	// The WriteRTP method will now check for stopped state and ignore packets
+
+	// Set recording as disabled
 	r.isRecordingEnabled = false
-	r.recorder = nil
+
+	// Clear participant filter
 	r.recordingParticipantFilter = nil
 
 	if r.OnEvent != nil {
@@ -834,6 +840,23 @@ func (r *Room) StopRecording() error {
 			Data: eventData,
 		})
 	}
+
+	// Schedule a cleanup after a short delay to allow in-flight packets to be processed
+	// This is done in a goroutine to not block the current thread
+	recorderId := r.recorder
+	go func() {
+		// Wait a short period to allow in-flight packets to be processed
+		time.Sleep(2 * time.Second)
+
+		// Acquire lock again for the delayed recorder nullification
+		r.mu.Lock()
+		defer r.mu.Unlock()
+
+		// Only nullify if this is still the same recorder
+		if r.recorder == recorderId {
+			r.recorder = nil
+		}
+	}()
 
 	return nil
 }

@@ -176,7 +176,18 @@ func (r *RoomRecorder) AddParticipant(participantID, trackID string, sampleRate 
 
 // WriteRTP writes an RTP packet for a specific participant track
 func (r *RoomRecorder) WriteRTP(participantID string, packet *rtp.Packet) error {
+	// Guard against nil recorder
+	if r == nil {
+		return fmt.Errorf("recorder is nil")
+	}
+
 	r.mu.RLock()
+	// Check if recorder is stopped
+	if r.state == RecordingStateStopped {
+		r.mu.RUnlock()
+		return nil // Silently ignore when recorder is stopped
+	}
+
 	participantMap, exists := r.participantRecsMap[participantID]
 	r.mu.RUnlock()
 
