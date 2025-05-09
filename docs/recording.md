@@ -71,8 +71,8 @@ if err != nil {
     log.Printf("Failed to pause recording: %v", err)
 }
 
-// Resume recording - pass empty identifier and nil config to resume current session
-err = room.StartRecording("", nil)
+// Resume recording
+err = room.ResumeRecording()
 if err != nil {
     log.Printf("Failed to resume recording: %v", err)
 }

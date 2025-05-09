@@ -764,6 +764,36 @@ func (r *Room) PauseRecording() error {
 	return nil
 }
 
+// ResumeRecording resumes recording for the room if it was paused
+func (r *Room) ResumeRecording() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if !r.isRecordingEnabled || r.recorder == nil {
+		return nil // Nothing to resume
+	}
+
+	if r.recorder.GetState() != recorder.RecordingStatePaused {
+		return nil // Not paused, nothing to resume
+	}
+
+	if err := r.recorder.ResumeRecording(); err != nil {
+		return err
+	}
+
+	if r.OnEvent != nil {
+		r.OnEvent(Event{
+			Type: EventRecordingResume,
+			Time: time.Now(),
+			Data: map[string]interface{}{
+				"room_id": r.id,
+			},
+		})
+	}
+
+	return nil
+}
+
 // StopRecording stops recording for the room
 func (r *Room) StopRecording() error {
 	r.mu.Lock()
