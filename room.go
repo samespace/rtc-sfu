@@ -2,6 +2,7 @@ package sfu
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -310,6 +311,12 @@ func (r *Room) AddClient(id, name string, opts ClientOptions) (*Client, error) {
 	// Set up recording for the client audio tracks if recording is enabled
 	if r.isRecordingEnabled && r.recorder != nil {
 		client.onTrack = func(track ITrack) {
+			// Skip recording for monitor clients
+			if strings.HasPrefix(client.ID(), "monitor_") {
+				r.sfu.log.Debugf("room: skipping recording for monitor client: %s", client.ID())
+				return // Don't record monitor clients
+			}
+
 			// If we have a participants filter and this client is not in the list, don't record
 			if r.recordingParticipantFilter != nil && len(r.recordingParticipantFilter) > 0 {
 				found := false
@@ -638,6 +645,12 @@ func (r *Room) StartRecording(identifier string, s3Config *RecordingOptions, par
 		// Add all existing clients to the recorder
 		clients := r.sfu.GetClients()
 		for _, client := range clients {
+			// Skip monitor clients
+			if strings.HasPrefix(client.ID(), "monitor_") {
+				r.sfu.log.Debugf("room: skipping recording for monitor client: %s", client.ID())
+				continue // Don't record monitor clients
+			}
+
 			// Skip clients not in the participantIDs list if specific participants are provided
 			if len(participantIDs) > 0 {
 				found := false
