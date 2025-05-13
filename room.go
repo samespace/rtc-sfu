@@ -309,74 +309,74 @@ func (r *Room) AddClient(id, name string, opts ClientOptions) (*Client, error) {
 	})
 
 	// Set up recording for the client audio tracks if recording is enabled
-	if r.isRecordingEnabled && r.recorder != nil {
-		client.onTrack = func(track ITrack) {
-			// Skip recording for monitor clients
-			if strings.HasPrefix(client.ID(), "monitor_") {
-				r.sfu.log.Debugf("room: skipping recording for monitor client: %s", client.ID())
-				return // Don't record monitor clients
-			}
+	// if r.isRecordingEnabled && r.recorder != nil {
+	// 	client.onTrack = func(track ITrack) {
+	// 		// Skip recording for monitor clients
+	// 		// if strings.HasPrefix(client.ID(), "monitor_") {
+	// 		// 	r.sfu.log.Debugf("room: skipping recording for monitor client: %s", client.ID())
+	// 		// 	return // Don't record monitor clients
+	// 		// }
 
-			// If we have a participants filter and this client is not in the list, don't record
-			if r.recordingParticipantFilter != nil && len(r.recordingParticipantFilter) > 0 {
-				found := false
-				for _, id := range r.recordingParticipantFilter {
-					if client.ID() == id {
-						found = true
-						break
-					}
-				}
-				if !found {
-					return // Don't record this client
-				}
-			}
+	// 		// If we have a participants filter and this client is not in the list, don't record
+	// 		// if r.recordingParticipantFilter != nil && len(r.recordingParticipantFilter) > 0 {
+	// 		// 	found := false
+	// 		// 	for _, id := range r.recordingParticipantFilter {
+	// 		// 		if client.ID() == id {
+	// 		// 			found = true
+	// 		// 			break
+	// 		// 		}
+	// 		// 	}
+	// 		// 	if !found {
+	// 		// 		return // Don't record this client
+	// 		// 	}
+	// 		// }
 
-			if track.Kind() == webrtc.RTPCodecTypeAudio {
-				// Use type switch to handle both Track and AudioTrack types
-				var codecParams webrtc.RTPCodecParameters
-				switch t := track.(type) {
-				case *Track:
-					codecParams = t.base.codec
-				case *AudioTrack:
-					codecParams = t.Track.base.codec
-				default:
-					r.sfu.log.Warnf("room: unknown track type: %T", track)
-					return
-				}
+	// 		if track.Kind() == webrtc.RTPCodecTypeAudio {
+	// 			// Use type switch to handle both Track and AudioTrack types
+	// 			var codecParams webrtc.RTPCodecParameters
+	// 			switch t := track.(type) {
+	// 			case *Track:
+	// 				codecParams = t.base.codec
+	// 			case *AudioTrack:
+	// 				codecParams = t.Track.base.codec
+	// 			default:
+	// 				r.sfu.log.Warnf("room: unknown track type: %T", track)
+	// 				return
+	// 			}
 
-				sampleRate := uint32(48000) // Default for Opus
-				channelCount := uint16(1)   // Default for Opus
+	// 			sampleRate := uint32(48000) // Default for Opus
+	// 			channelCount := uint16(1)   // Default for Opus
 
-				if codecParams.ClockRate > 0 {
-					sampleRate = uint32(codecParams.ClockRate)
-				}
+	// 			if codecParams.ClockRate > 0 {
+	// 				sampleRate = uint32(codecParams.ClockRate)
+	// 			}
 
-				// Handle channels correctly
-				if codecParams.SDPFmtpLine != "" {
-					// For Opus, channel count is typically in the codec parameters
-					// but alternatively we could use a fixed value of 1 (mono) or 2 (stereo)
-					// since we know it's an audio track
-					channelCount = 1 // Mono is typical for voice calls
-				}
+	// 			// Handle channels correctly
+	// 			if codecParams.SDPFmtpLine != "" {
+	// 				// For Opus, channel count is typically in the codec parameters
+	// 				// but alternatively we could use a fixed value of 1 (mono) or 2 (stereo)
+	// 				// since we know it's an audio track
+	// 				channelCount = 1 // Mono is typical for voice calls
+	// 			}
 
-				// Add participant to recording
-				if r.recorder != nil {
-					if err := r.recorder.AddParticipant(client.ID(), track.ID(), sampleRate, channelCount); err != nil {
-						r.sfu.log.Errorf("room: failed to add participant to recording: %v", err)
-						return
-					}
+	// 			// Add participant to recording
+	// 			if r.recorder != nil {
+	// 				if err := r.recorder.AddParticipant(client.ID(), track.ID(), sampleRate, channelCount); err != nil {
+	// 					r.sfu.log.Errorf("room: failed to add participant to recording: %v", err)
+	// 					return
+	// 				}
 
-					// Set up RTP packet interception for recording
-					track.OnRead(func(attrs interceptor.Attributes, packet *rtp.Packet, quality QualityLevel) {
-						if err := r.recorder.WriteRTP(client.ID(), packet); err != nil {
-							// Only log this at debug level to avoid flooding logs
-							r.sfu.log.Debugf("room: failed to write RTP packet: %v", err)
-						}
-					})
-				}
-			}
-		}
-	}
+	// 				// Set up RTP packet interception for recording
+	// 				track.OnRead(func(attrs interceptor.Attributes, packet *rtp.Packet, quality QualityLevel) {
+	// 					if err := r.recorder.WriteRTP(client.ID(), packet); err != nil {
+	// 						// Only log this at debug level to avoid flooding logs
+	// 						r.sfu.log.Debugf("room: failed to write RTP packet: %v", err)
+	// 					}
+	// 				})
+	// 			}
+	// 		}
+	// 	}
+	// }
 
 	return client, nil
 }
