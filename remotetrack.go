@@ -82,6 +82,7 @@ func (t *remoteTrack) SetRecordingManager(manager *recording.RecordingManager, c
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	t.log.Infof("[RECORDING] Setting recording manager for track %s, client %s", trackID, clientID)
 	t.recordingManager = manager
 	t.clientID = clientID
 	t.trackID = trackID
@@ -97,9 +98,20 @@ func (t *remoteTrack) readRTP() {
 	defer t.onEnded()
 
 	buffer := make([]byte, 1500)
+	packetCount := 0
+	recordedPacketCount := 0
+
+	if t.isAudioTrack {
+		t.log.Infof("[RECORDING] Starting to read RTP for audio track: %s", t.track.ID())
+	}
+
 	for {
 		select {
 		case <-readCtx.Done():
+			if t.isAudioTrack {
+				t.log.Infof("[RECORDING] Stopped reading RTP for audio track: %s, processed %d packets, recorded %d packets",
+					t.track.ID(), packetCount, recordedPacketCount)
+			}
 			return
 		default:
 			if err := t.track.SetReadDeadline(time.Now().Add(1 * time.Second)); err != nil {
@@ -136,6 +148,8 @@ func (t *remoteTrack) readRTP() {
 				go t.updateStats()
 			}
 
+			packetCount++
+
 			// Handle recording for audio tracks
 			if t.isAudioTrack && t.recordingManager != nil {
 				t.mu.RLock()
@@ -147,7 +161,18 @@ func (t *remoteTrack) readRTP() {
 				if clientID != "" && trackID != "" && manager != nil {
 					if err := manager.WriteRTP(clientID, trackID, p); err != nil {
 						// Only log at trace level as this may happen frequently
-						t.log.Tracef("remotetrack: failed to write RTP packet to recorder: %v", err)
+						t.log.Tracef("[RECORDING] Failed to write RTP packet to recorder: %v", err)
+					} else {
+						recordedPacketCount++
+						if recordedPacketCount%500 == 0 { // Log every 500 packets
+							t.log.Debugf("[RECORDING] Recorded %d packets for track %s, client %s",
+								recordedPacketCount, trackID, clientID)
+						}
+					}
+				} else if t.isAudioTrack && (clientID == "" || trackID == "" || manager == nil) {
+					if packetCount%500 == 0 { // Don't spam logs
+						t.log.Warnf("[RECORDING] Missing recording info: clientID=%s, trackID=%s, manager=%v",
+							clientID, trackID, manager != nil)
 					}
 				}
 			}

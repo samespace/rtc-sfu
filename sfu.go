@@ -479,9 +479,18 @@ func (s *SFU) StartRecording(recordingID string, s3Config *recording.S3Config) e
 	s.recordingManagerMu.Lock()
 	defer s.recordingManagerMu.Unlock()
 
+	s.log.Infof("[RECORDING] Attempting to start recording with ID: %s, basePath: %s", recordingID, s.recordingBasePath)
+
 	// Check if already recording
 	if s.recordingManager != nil {
+		s.log.Warnf("[RECORDING] Cannot start recording - already recording")
 		return fmt.Errorf("already recording")
+	}
+
+	// Check if base path is set
+	if s.recordingBasePath == "" {
+		s.log.Errorf("[RECORDING] Cannot start recording - recording base path is not set")
+		return fmt.Errorf("recording base path is not set")
 	}
 
 	// Create recording config
@@ -495,9 +504,12 @@ func (s *SFU) StartRecording(recordingID string, s3Config *recording.S3Config) e
 		UploadMergedOnly: true, // Only upload merged file by default
 	}
 
+	s.log.Infof("[RECORDING] Creating recording manager with config: %+v", config)
+
 	// Create recording manager
 	manager, err := recording.NewRecordingManager(s.context, config, s.log)
 	if err != nil {
+		s.log.Errorf("[RECORDING] Failed to create recording manager: %v", err)
 		return fmt.Errorf("failed to create recording manager: %w", err)
 	}
 
@@ -505,18 +517,30 @@ func (s *SFU) StartRecording(recordingID string, s3Config *recording.S3Config) e
 
 	// Start recording
 	if err := manager.Start(); err != nil {
+		s.log.Errorf("[RECORDING] Failed to start recording: %v", err)
 		s.recordingManager = nil
 		return fmt.Errorf("failed to start recording: %w", err)
 	}
 
+	s.log.Infof("[RECORDING] Recording started successfully. Adding existing tracks...")
+
 	// Add existing audio tracks to recording
+	trackCount := 0
+	clientCount := 0
 	for _, client := range s.clients.GetClients() {
+		clientCount++
+		s.log.Infof("[RECORDING] Processing client %s, channel type: %d", client.ID(), client.options.ChannelType)
+
 		for _, track := range client.tracks.GetTracks() {
 			if track.Kind() == webrtc.RTPCodecTypeAudio {
+				s.log.Infof("[RECORDING] Found audio track from client %s: %s", client.ID(), track.ID())
+				trackCount++
 				s.addTrackToRecording(client.ID(), track)
 			}
 		}
 	}
+
+	s.log.Infof("[RECORDING] Added %d audio tracks from %d clients to recording", trackCount, clientCount)
 
 	return nil
 }
@@ -587,37 +611,50 @@ func (s *SFU) addTrackToRecording(clientID string, track ITrack) {
 	defer s.recordingManagerMu.RUnlock()
 
 	if s.recordingManager == nil || track.Kind() != webrtc.RTPCodecTypeAudio {
+		if s.recordingManager == nil {
+			s.log.Warnf("[RECORDING] Cannot add track - recording manager is nil")
+		}
 		return
 	}
+
+	s.log.Infof("[RECORDING] Adding track %s from client %s to recording", track.ID(), clientID)
 
 	// Find the remote track implementation
 	var remoteTrackImpl *remoteTrack
 
 	switch t := track.(type) {
 	case *AudioTrack:
+		s.log.Infof("[RECORDING] Track %s is an AudioTrack", track.ID())
 		remoteTrackImpl = t.RemoteTrack()
+		if remoteTrackImpl == nil {
+			s.log.Errorf("[RECORDING] Failed to get remoteTrack from AudioTrack %s", track.ID())
+		}
 	case *Track:
 		// Skip video tracks
+		s.log.Infof("[RECORDING] Track %s is a video Track, skipping", track.ID())
 		return
 	case *SimulcastTrack:
 		// Skip simulcast tracks (these are video)
+		s.log.Infof("[RECORDING] Track %s is a SimulcastTrack, skipping", track.ID())
 		return
 	default:
-		s.log.Warnf("Unknown track type for recording: %T", track)
+		s.log.Warnf("[RECORDING] Unknown track type for recording: %T", track)
 		return
 	}
 
 	client, err := s.clients.GetClient(clientID)
 	if err != nil {
-		s.log.Errorf("Failed to find client for recording: %v", err)
+		s.log.Errorf("[RECORDING] Failed to find client %s for recording: %v", clientID, err)
 		return
 	}
 
 	// Get the channel type for this client
 	channelType := int(client.options.ChannelType)
+	s.log.Infof("[RECORDING] Client %s has channel type: %d", clientID, channelType)
 
 	// Don't record if channel type is NoRecord
 	if channelType == int(recording.ChannelTypeNoRecord) {
+		s.log.Infof("[RECORDING] Client %s has ChannelTypeNoRecord, skipping", clientID)
 		return
 	}
 
@@ -627,20 +664,24 @@ func (s *SFU) addTrackToRecording(clientID string, track ITrack) {
 		codec := remoteTrackImpl.track.Codec()
 		if codec.MimeType != "" {
 			sampleRate = codec.ClockRate
+			s.log.Infof("[RECORDING] Track %s codec: %s, sample rate: %d", track.ID(), codec.MimeType, sampleRate)
 		}
 	}
 
 	// Add track to recording manager
 	_, err = s.recordingManager.AddTrack(clientID, track.ID(), channelType, sampleRate)
 	if err != nil {
-		s.log.Errorf("Failed to add track to recording: %v", err)
+		s.log.Errorf("[RECORDING] Failed to add track %s to recording: %v", track.ID(), err)
 		return
 	}
 
 	// Set recording manager on remote track for packet routing
 	if remoteTrackImpl != nil {
+		s.log.Infof("[RECORDING] Setting recording manager on remote track %s", track.ID())
 		remoteTrackImpl.SetRecordingManager(s.recordingManager, clientID, track.ID())
-		s.log.Infof("Added track %s from client %s to recording", track.ID(), clientID)
+		s.log.Infof("[RECORDING] Successfully added track %s from client %s to recording", track.ID(), clientID)
+	} else {
+		s.log.Errorf("[RECORDING] Cannot set recording manager - remoteTrackImpl is nil for track %s", track.ID())
 	}
 }
 

@@ -3,6 +3,7 @@ package recording
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 
@@ -51,6 +52,15 @@ type RecordingManager struct {
 func NewRecordingManager(ctx context.Context, config RecordingConfig, logger logging.LeveledLogger) (*RecordingManager, error) {
 	recordingCtx, cancel := context.WithCancel(ctx)
 
+	logger.Infof("[RECORDING] Creating new recording manager for recording ID: %s, in base path: %s",
+		config.RecordingID, config.BasePath)
+
+	// Ensure base path exists
+	if err := os.MkdirAll(config.BasePath, 0755); err != nil {
+		logger.Errorf("[RECORDING] Failed to create base directory: %v", err)
+		return nil, fmt.Errorf("failed to create base directory: %w", err)
+	}
+
 	manager := &RecordingManager{
 		config:     config,
 		recorders:  make(map[string]map[string]Recorder),
@@ -69,19 +79,25 @@ func NewRecordingManager(ctx context.Context, config RecordingConfig, logger log
 		Logger:           logger,
 	}
 
+	logger.Infof("[RECORDING] Creating merger with output path: %s", mergerConfig.OutputPath)
 	manager.merger = NewMerger(recordingCtx, mergerConfig)
 	manager.outputPath = mergerConfig.OutputPath
 
 	// Initialize S3 uploader if needed
 	if config.UploadToS3 && config.S3Config != nil {
+		logger.Infof("[RECORDING] Initializing S3 uploader with endpoint: %s, bucket: %s",
+			config.S3Config.Endpoint, config.S3Config.Bucket)
 		uploader, err := NewUploader(recordingCtx, *config.S3Config, logger)
 		if err != nil {
 			cancel()
+			logger.Errorf("[RECORDING] Failed to create S3 uploader: %v", err)
 			return nil, fmt.Errorf("failed to create S3 uploader: %w", err)
 		}
 		manager.uploader = uploader
+		logger.Infof("[RECORDING] S3 uploader initialized successfully")
 	}
 
+	logger.Infof("[RECORDING] Recording manager created successfully")
 	return manager, nil
 }
 
@@ -90,21 +106,28 @@ func (m *RecordingManager) Start() error {
 	m.recordersLock.Lock()
 	defer m.recordersLock.Unlock()
 
+	m.logger.Infof("[RECORDING] Starting recording with state: %v", m.state)
+
 	if m.state == RecordingStateRecording {
+		m.logger.Infof("[RECORDING] Recording is already in progress")
 		return nil // Already recording
 	}
 
 	m.state = RecordingStateRecording
 
 	// Start all recorders
-	for _, clientRecorders := range m.recorders {
-		for _, recorder := range clientRecorders {
+	recorderCount := 0
+	for clientID, clientRecorders := range m.recorders {
+		for trackID, recorder := range clientRecorders {
+			recorderCount++
+			m.logger.Infof("[RECORDING] Starting recorder for track %s from client %s", trackID, clientID)
 			if err := recorder.Start(); err != nil {
-				m.logger.Errorf("Failed to start recorder: %v", err)
+				m.logger.Errorf("[RECORDING] Failed to start recorder for track %s: %v", trackID, err)
 			}
 		}
 	}
 
+	m.logger.Infof("[RECORDING] Started %d recorders successfully", recorderCount)
 	return nil
 }
 
@@ -159,7 +182,10 @@ func (m *RecordingManager) Stop() error {
 	m.recordersLock.Lock()
 	defer m.recordersLock.Unlock()
 
+	m.logger.Infof("[RECORDING] Stopping recording with state: %v", m.state)
+
 	if m.state == RecordingStateStopped {
+		m.logger.Infof("[RECORDING] Recording is already stopped")
 		return nil // Already stopped
 	}
 
@@ -167,42 +193,52 @@ func (m *RecordingManager) Stop() error {
 	m.state = RecordingStateStopped
 
 	// Stop all recorders
+	recorderCount := 0
 	for clientID, clientRecorders := range m.recorders {
 		for trackID, recorder := range clientRecorders {
+			recorderCount++
+			m.logger.Infof("[RECORDING] Stopping recorder for track %s from client %s", trackID, clientID)
 			if err := recorder.Stop(); err != nil {
-				m.logger.Errorf("Failed to stop recorder: %v", err)
+				m.logger.Errorf("[RECORDING] Failed to stop recorder for track %s: %v", trackID, err)
 			}
 
 			// Add to merger
-			m.merger.AddRecording(recorder.GetMetadata(), recorder.GetFilePath())
-			m.logger.Infof("Added recording for client %s, track %s to merger", clientID, trackID)
+			m.logger.Infof("[RECORDING] Adding track %s to merger", trackID)
+			metadata := recorder.GetMetadata()
+			filePath := recorder.GetFilePath()
+			m.merger.AddRecording(metadata, filePath)
+			m.logger.Infof("[RECORDING] Added recording for client %s, track %s to merger", clientID, trackID)
 		}
 	}
+
+	m.logger.Infof("[RECORDING] Stopped %d recorders", recorderCount)
 
 	// Only merge if we were recording before
 	if prevState == RecordingStateRecording || prevState == RecordingStatePaused {
 		// Merge files
+		m.logger.Infof("[RECORDING] Starting to merge recordings")
 		outputPath, err := m.merger.MergeAll(m.context)
 		if err != nil {
-			m.logger.Errorf("Failed to merge recordings: %v", err)
+			m.logger.Errorf("[RECORDING] Failed to merge recordings: %v", err)
 		} else {
-			m.logger.Infof("Successfully merged recordings to %s", outputPath)
+			m.logger.Infof("[RECORDING] Successfully merged recordings to %s", outputPath)
 
 			// Upload to S3 if configured
 			if m.config.UploadToS3 && m.uploader != nil {
-				m.logger.Infof("Uploading recordings to S3...")
+				m.logger.Infof("[RECORDING] Uploading recordings to S3...")
 
 				urls, err := m.uploader.UploadRecording(m.context, m.config.RecordingID, m.config.BasePath, m.config.UploadMergedOnly)
 				if err != nil {
-					m.logger.Errorf("Failed to upload recordings: %v", err)
+					m.logger.Errorf("[RECORDING] Failed to upload recordings: %v", err)
 				} else {
-					m.logger.Infof("Successfully uploaded %d files to S3", len(urls))
+					m.logger.Infof("[RECORDING] Successfully uploaded %d files to S3: %v", len(urls), urls)
 				}
 			}
 		}
 	}
 
 	// Cleanup
+	m.logger.Infof("[RECORDING] Cleaning up recording resources")
 	m.cancelFunc()
 
 	return nil
@@ -213,21 +249,30 @@ func (m *RecordingManager) AddTrack(clientID, trackID string, channelType int, s
 	m.recordersLock.Lock()
 	defer m.recordersLock.Unlock()
 
+	m.logger.Infof("[RECORDING] Adding track %s from client %s (channel type: %d, sample rate: %d)",
+		trackID, clientID, channelType, sampleRate)
+
 	// Check if already recording this track
 	if clientRecorders, exists := m.recorders[clientID]; exists {
 		if recorder, exists := clientRecorders[trackID]; exists {
+			m.logger.Infof("[RECORDING] Track %s from client %s is already being recorded", trackID, clientID)
 			return recorder, nil
 		}
 	} else {
 		m.recorders[clientID] = make(map[string]Recorder)
+		m.logger.Infof("[RECORDING] Created new recorder map for client %s", clientID)
 	}
 
 	// Don't record tracks with ChannelTypeNoRecord
 	if channelType == int(ChannelTypeNoRecord) {
+		m.logger.Infof("[RECORDING] Track %s from client %s has ChannelTypeNoRecord, skipping", trackID, clientID)
 		return nil, fmt.Errorf("track is configured not to be recorded")
 	}
 
 	// Create recorder
+	dirPath := filepath.Join(m.config.BasePath, m.config.RecordingID, clientID)
+	m.logger.Infof("[RECORDING] Creating directory for client %s: %s", clientID, dirPath)
+
 	recorder, err := NewOggOpusRecorder(
 		m.context,
 		m.config.BasePath,
@@ -241,18 +286,22 @@ func (m *RecordingManager) AddTrack(clientID, trackID string, channelType int, s
 	)
 
 	if err != nil {
+		m.logger.Errorf("[RECORDING] Failed to create recorder for track %s: %v", trackID, err)
 		return nil, fmt.Errorf("failed to create recorder: %w", err)
 	}
 
+	m.logger.Infof("[RECORDING] Created recorder for track %s at %s", trackID, recorder.GetFilePath())
 	m.recorders[clientID][trackID] = recorder
 
 	// Start recording if already in recording state
 	if m.state == RecordingStateRecording {
+		m.logger.Infof("[RECORDING] Starting recorder for track %s as manager is already recording", trackID)
 		if err := recorder.Start(); err != nil {
-			m.logger.Errorf("Failed to start recorder: %v", err)
+			m.logger.Errorf("[RECORDING] Failed to start recorder: %v", err)
 		}
 	}
 
+	m.logger.Infof("[RECORDING] Track %s added successfully to recording", trackID)
 	return recorder, nil
 }
 
