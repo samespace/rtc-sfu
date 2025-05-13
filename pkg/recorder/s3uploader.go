@@ -84,7 +84,7 @@ func (u *S3Uploader) UploadFile(ctx context.Context, filePath, objectName string
 		return fmt.Errorf("failed to upload file to S3: %w", err)
 	}
 
-	fmt.Printf("Successfully uploaded to S3: bucket=%s, object=%s\n", u.bucketName, s3ObjectName)
+	fmt.Printf("Successfully uploaded: bucket=%s, object=%s\n", u.bucketName, s3ObjectName)
 	return nil
 }
 

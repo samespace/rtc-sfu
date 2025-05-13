@@ -214,6 +214,9 @@ func DefaultClientOptions() ClientOptions {
 }
 
 func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Configuration, opts ClientOptions) *Client {
+
+	s.log.Errorf("NewClient: %s, %s", id, name)
+
 	var client *Client
 	var vadInterceptor *voiceactivedetector.Interceptor
 
@@ -484,6 +487,8 @@ func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Confi
 	// Set a handler for when a new remote track starts, this just distributes all our packets
 	// to connected peers
 	peerConnection.OnTrack(func(remoteTrack *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+
+		s.log.Errorf(">>>>>> Remote Track =%s, client=%s\n", remoteTrack.ID(), client.id)
 
 		var track ITrack
 
