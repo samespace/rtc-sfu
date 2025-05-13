@@ -496,6 +496,8 @@ func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Confi
 
 		defer client.log.Infof("client: new track id %s rid %s ssrc %d kind %s", remoteTrack.ID(), remoteTrack.RID(), remoteTrack.SSRC(), remoteTrack.Kind())
 
+		s.log.Errorf(">>>>>> remoteTrackID =%s", remoteTrackID)
+
 		// make sure the remote track ID is not empty
 		if remoteTrackID == "" {
 			client.log.Errorf("client: error remote track id is empty")
@@ -517,6 +519,8 @@ func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Confi
 		onStatsUpdated := func(stats *stats.Stats) {
 			client.stats.SetReceiver(remoteTrack.ID(), remoteTrack.RID(), *stats)
 		}
+
+		s.log.Errorf(">>>>>> remoteTrackRID =%s", remoteTrack.RID())
 
 		if remoteTrack.RID() == "" {
 			// not simulcast
@@ -555,6 +559,7 @@ func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Confi
 				client.log.Errorf("client: error add track ", err)
 			}
 
+			s.log.Errorf(">>>>>> Calling client.onTrack")
 			client.onTrack(track)
 			track.SetAsProcessed()
 		} else {
@@ -599,6 +604,7 @@ func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Confi
 				simulcast.AddRemoteTrack(remoteTrack, opts.JitterBufferMinWait, opts.JitterBufferMaxWait, client.statsGetter, onStatsUpdated, onPLI)
 			}
 
+			s.log.Errorf(">>>>>> Calling client.onTrack")
 			if !track.IsProcessed() {
 				client.onTrack(track)
 				track.SetAsProcessed()
