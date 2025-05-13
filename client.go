@@ -1966,6 +1966,7 @@ func (c *Client) UnsubscribeTracks(trackIDs []string) error {
 		}
 		// delete from map early to avoid races with push loops
 		delete(c.clientTracks, id)
+		c.publishedTracks.remove([]string{id})
 		c.muTracks.Unlock()
 
 		// Remove sender from PeerConnection
