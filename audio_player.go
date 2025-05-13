@@ -144,7 +144,12 @@ func (p *AudioPlayer) loop(url string, loop bool, ssrc webrtc.SSRC) {
 				r.Close()
 				return
 			default:
-				// drop if buffer full to avoid deadlock
+				// channel full, drop
+			}
+
+			// pacing: sleep for the duration represented by this opus frame
+			if sampleCount > 0 {
+				time.Sleep(time.Duration(sampleCount) * time.Second / 48000)
 			}
 		}
 		r.Close()
