@@ -389,7 +389,10 @@ func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Confi
 
 		addedTracks := client.pendingPublishedTracks.GetTracks()
 
+		s.log.Errorf(">>>>>> client.onTracksAdded 2222")
+
 		if client.onTracksAdded != nil {
+			s.log.Errorf(">>>>>> client.onTracksAdded 3333")
 			client.onTracksAdded(addedTracks)
 		}
 	}
