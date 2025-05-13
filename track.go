@@ -81,6 +81,7 @@ type AudioTrack struct {
 	*Track
 	vad          *voiceactivedetector.VoiceDetector
 	vadCallbacks []func([]voiceactivedetector.VoicePacketData)
+	remoteTrack  *remoteTrack
 }
 
 func newTrack(ctx context.Context, client *Client, trackRemote IRemoteTrack, minWait, maxWait, pliInterval time.Duration, onPLI func(), stats stats.Getter, onStatsUpdated func(*stats.Stats)) ITrack {
@@ -999,4 +1000,8 @@ func RIDToQuality(RID string) QualityLevel {
 	default:
 		return QualityLow
 	}
+}
+
+func (t *AudioTrack) RemoteTrack() *remoteTrack {
+	return t.Track.RemoteTrack()
 }

@@ -28,6 +28,7 @@ import (
 
 type ClientState int
 type ClientType string
+type ChannelType int
 
 const (
 	ClientStateNew     = 0
@@ -38,6 +39,11 @@ const (
 	ClientTypePeer       = "peer"
 	ClientTypeUpBridge   = "upbridge"
 	ClientTypeDownBridge = "downbridge"
+
+	// Channel types for stereo recording
+	ChannelTypeNoRecord = 0 // Do not record this participant
+	ChannelTypeLeft     = 1 // Left channel in stereo file
+	ChannelTypeRight    = 2 // Right channel in stereo file
 
 	QualityAudioRed = 11
 	QualityAudio    = 10
@@ -70,6 +76,7 @@ type ClientOptions struct {
 	IceTrickle           bool          `json:"ice_trickle"`
 	IdleTimeout          time.Duration `json:"idle_timeout"`
 	Type                 string        `json:"type"`
+	ChannelType          ChannelType   `json:"channel_type"` // Channel type for stereo recording
 	EnableVoiceDetection bool          `json:"enable_voice_detection"`
 	EnablePlayoutDelay   bool          `json:"enable_playout_delay"`
 	EnableOpusDTX        bool          `json:"enable_opus_dtx"`
@@ -200,6 +207,7 @@ func DefaultClientOptions() ClientOptions {
 		IceTrickle:           true,
 		IdleTimeout:          5 * time.Minute,
 		Type:                 ClientTypePeer,
+		ChannelType:          ChannelTypeLeft,
 		EnableVoiceDetection: true,
 		EnablePlayoutDelay:   true,
 		EnableOpusDTX:        true,
@@ -651,7 +659,7 @@ func (c *Client) Context() context.Context {
 
 // OnTrackAdded event is to confirmed the source type of the pending published tracks.
 // If the event is not listened, the pending published tracks will be ignored and not published to other clients.
-// Once received, respond with `client.SetTracksSourceType()“ to confirm the source type of the pending published tracks
+// Once received, respond with `client.SetTracksSourceType()" to confirm the source type of the pending published tracks
 func (c *Client) OnTracksAdded(callback func(addedTracks []ITrack)) {
 	c.muCallback.Lock()
 	defer c.muCallback.Unlock()

@@ -2,9 +2,11 @@ package sfu
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
+	"github.com/inlivedev/sfu/pkg/recording"
 	"github.com/pion/logging"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
@@ -122,6 +124,10 @@ type SFU struct {
 	clientStats               map[string]*ClientStats
 	log                       logging.LeveledLogger
 	defaultSettingEngine      *webrtc.SettingEngine
+	// Recording related fields
+	recordingManager   *recording.RecordingManager
+	recordingManagerMu sync.RWMutex
+	recordingBasePath  string
 }
 
 type PublishedTrack struct {
@@ -192,6 +198,11 @@ func (s *SFU) NewClient(id, name string, opts ClientOptions) *Client {
 	opts.Log = s.log
 
 	client := s.createClient(id, name, peerConnectionConfig, opts)
+
+	// Set up the onTracksAdded callback to handle recording
+	client.OnTracksAdded(func(tracks []ITrack) {
+		s.onTracksAdded(id, tracks)
+	})
 
 	s.addClient(client)
 
@@ -461,4 +472,187 @@ func (s *SFU) AddRelayTrack(ctx context.Context, id, streamid, rid string, clien
 	s.onTracksAvailable(client.ID(), []ITrack{track})
 
 	return nil
+}
+
+// StartRecording starts recording for the room
+func (s *SFU) StartRecording(recordingID string, s3Config *recording.S3Config) error {
+	s.recordingManagerMu.Lock()
+	defer s.recordingManagerMu.Unlock()
+
+	// Check if already recording
+	if s.recordingManager != nil {
+		return fmt.Errorf("already recording")
+	}
+
+	// Create recording config
+	config := recording.RecordingConfig{
+		BasePath:         s.recordingBasePath,
+		RecordingID:      recordingID,
+		SampleRate:       48000, // Standard for WebRTC audio
+		ChannelCount:     1,     // Mono for individual recordings
+		UploadToS3:       s3Config != nil,
+		S3Config:         s3Config,
+		UploadMergedOnly: true, // Only upload merged file by default
+	}
+
+	// Create recording manager
+	manager, err := recording.NewRecordingManager(s.context, config, s.log)
+	if err != nil {
+		return fmt.Errorf("failed to create recording manager: %w", err)
+	}
+
+	s.recordingManager = manager
+
+	// Start recording
+	if err := manager.Start(); err != nil {
+		s.recordingManager = nil
+		return fmt.Errorf("failed to start recording: %w", err)
+	}
+
+	// Add existing audio tracks to recording
+	for _, client := range s.clients.GetClients() {
+		for _, track := range client.tracks.GetTracks() {
+			if track.Kind() == webrtc.RTPCodecTypeAudio {
+				s.addTrackToRecording(client.ID(), track)
+			}
+		}
+	}
+
+	return nil
+}
+
+// PauseRecording pauses the current recording
+func (s *SFU) PauseRecording() error {
+	s.recordingManagerMu.RLock()
+	defer s.recordingManagerMu.RUnlock()
+
+	if s.recordingManager == nil {
+		return fmt.Errorf("not recording")
+	}
+
+	return s.recordingManager.Pause()
+}
+
+// ResumeRecording resumes a paused recording
+func (s *SFU) ResumeRecording() error {
+	s.recordingManagerMu.RLock()
+	defer s.recordingManagerMu.RUnlock()
+
+	if s.recordingManager == nil {
+		return fmt.Errorf("not recording")
+	}
+
+	return s.recordingManager.Resume()
+}
+
+// StopRecording stops the current recording
+func (s *SFU) StopRecording() (string, error) {
+	s.recordingManagerMu.Lock()
+	defer s.recordingManagerMu.Unlock()
+
+	if s.recordingManager == nil {
+		return "", fmt.Errorf("not recording")
+	}
+
+	outputPath := s.recordingManager.GetOutputPath()
+
+	err := s.recordingManager.Stop()
+	if err != nil {
+		return outputPath, err
+	}
+
+	s.recordingManager = nil
+	return outputPath, nil
+}
+
+// SetRecordingBasePath sets the base path for recordings
+func (s *SFU) SetRecordingBasePath(path string) {
+	s.recordingManagerMu.Lock()
+	defer s.recordingManagerMu.Unlock()
+
+	s.recordingBasePath = path
+}
+
+// IsRecording checks if the room is currently recording
+func (s *SFU) IsRecording() bool {
+	s.recordingManagerMu.RLock()
+	defer s.recordingManagerMu.RUnlock()
+
+	return s.recordingManager != nil
+}
+
+// Internal method to add a track to recording
+func (s *SFU) addTrackToRecording(clientID string, track ITrack) {
+	s.recordingManagerMu.RLock()
+	defer s.recordingManagerMu.RUnlock()
+
+	if s.recordingManager == nil || track.Kind() != webrtc.RTPCodecTypeAudio {
+		return
+	}
+
+	// Find the remote track implementation
+	var remoteTrackImpl *remoteTrack
+
+	switch t := track.(type) {
+	case *AudioTrack:
+		remoteTrackImpl = t.RemoteTrack()
+	case *Track:
+		// Skip video tracks
+		return
+	case *SimulcastTrack:
+		// Skip simulcast tracks (these are video)
+		return
+	default:
+		s.log.Warnf("Unknown track type for recording: %T", track)
+		return
+	}
+
+	client, err := s.clients.GetClient(clientID)
+	if err != nil {
+		s.log.Errorf("Failed to find client for recording: %v", err)
+		return
+	}
+
+	// Get the channel type for this client
+	channelType := int(client.options.ChannelType)
+
+	// Don't record if channel type is NoRecord
+	if channelType == int(recording.ChannelTypeNoRecord) {
+		return
+	}
+
+	// Find the correct sample rate from the codec
+	sampleRate := uint32(48000) // Default to 48kHz
+	if remoteTrackImpl != nil && remoteTrackImpl.track != nil {
+		codec := remoteTrackImpl.track.Codec()
+		if codec.MimeType != "" {
+			sampleRate = codec.ClockRate
+		}
+	}
+
+	// Add track to recording manager
+	_, err = s.recordingManager.AddTrack(clientID, track.ID(), channelType, sampleRate)
+	if err != nil {
+		s.log.Errorf("Failed to add track to recording: %v", err)
+		return
+	}
+
+	// Set recording manager on remote track for packet routing
+	if remoteTrackImpl != nil {
+		remoteTrackImpl.SetRecordingManager(s.recordingManager, clientID, track.ID())
+		s.log.Infof("Added track %s from client %s to recording", track.ID(), clientID)
+	}
+}
+
+// Handle track added
+func (s *SFU) onTracksAdded(clientID string, tracks []ITrack) {
+	// Call the onTracksAvailable method to notify other clients
+	s.onTracksAvailable(clientID, tracks)
+
+	// Add audio tracks to recording if needed
+	for _, track := range tracks {
+		if track.Kind() == webrtc.RTPCodecTypeAudio {
+			s.addTrackToRecording(clientID, track)
+		}
+	}
 }

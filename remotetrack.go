@@ -9,11 +9,13 @@ import (
 	"sync/atomic"
 
 	"github.com/inlivedev/sfu/pkg/networkmonitor"
+	"github.com/inlivedev/sfu/pkg/recording"
 	"github.com/inlivedev/sfu/pkg/rtppool"
 	"github.com/pion/interceptor"
 	"github.com/pion/interceptor/pkg/stats"
 	"github.com/pion/logging"
 	"github.com/pion/rtp"
+	"github.com/pion/webrtc/v4"
 )
 
 type remoteTrack struct {
@@ -33,6 +35,12 @@ type remoteTrack struct {
 	onStatsUpdated        func(*stats.Stats)
 	log                   logging.LeveledLogger
 	rtppool               *rtppool.RTPPool
+	// Recording related fields
+	recorder         recording.Recorder
+	isAudioTrack     bool
+	recordingManager *recording.RecordingManager
+	clientID         string
+	trackID          string
 }
 
 func newRemoteTrack(ctx context.Context, log logging.LeveledLogger, useBuffer bool, track IRemoteTrack, minWait, maxWait, pliInterval time.Duration, onPLI func(), statsGetter stats.Getter, onStatsUpdated func(*stats.Stats), onRead func(interceptor.Attributes, *rtp.Packet), pool *rtppool.RTPPool, onNetworkConditionChanged func(networkmonitor.NetworkConditionType)) *remoteTrack {
@@ -54,6 +62,7 @@ func newRemoteTrack(ctx context.Context, log logging.LeveledLogger, useBuffer bo
 		onRead:                onRead,
 		log:                   log,
 		rtppool:               pool,
+		isAudioTrack:          track.Kind() == webrtc.RTPCodecTypeAudio,
 	}
 
 	if pliInterval > 0 {
@@ -67,6 +76,15 @@ func newRemoteTrack(ctx context.Context, log logging.LeveledLogger, useBuffer bo
 
 func (t *remoteTrack) Context() context.Context {
 	return t.context
+}
+
+func (t *remoteTrack) SetRecordingManager(manager *recording.RecordingManager, clientID, trackID string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.recordingManager = manager
+	t.clientID = clientID
+	t.trackID = trackID
 }
 
 func (t *remoteTrack) readRTP() {
@@ -116,6 +134,22 @@ func (t *remoteTrack) readRTP() {
 
 			if !t.IsRelay() {
 				go t.updateStats()
+			}
+
+			// Handle recording for audio tracks
+			if t.isAudioTrack && t.recordingManager != nil {
+				t.mu.RLock()
+				clientID := t.clientID
+				trackID := t.trackID
+				manager := t.recordingManager
+				t.mu.RUnlock()
+
+				if clientID != "" && trackID != "" && manager != nil {
+					if err := manager.WriteRTP(clientID, trackID, p); err != nil {
+						// Only log at trace level as this may happen frequently
+						t.log.Tracef("remotetrack: failed to write RTP packet to recorder: %v", err)
+					}
+				}
 			}
 
 			t.onRead(attrs, p)
