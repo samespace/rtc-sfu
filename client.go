@@ -559,7 +559,7 @@ func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Confi
 				client.log.Errorf("client: error add track ", err)
 			}
 
-			s.log.Errorf(">>>>>> Calling client.onTrack")
+			s.log.Errorf(">>>>>> Calling client.onTrack 111")
 			client.onTrack(track)
 			track.SetAsProcessed()
 		} else {
