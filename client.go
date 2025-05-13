@@ -370,6 +370,9 @@ func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Confi
 	}
 
 	client.onTrack = func(track ITrack) {
+
+		s.log.Errorf(">>>>>> client on Track Called >>>>>>")
+
 		if err := client.pendingPublishedTracks.Add(track); err == ErrTrackExists {
 			s.log.Errorf("client: client %s track already added ", track.ID())
 			// not an error could be because a simulcast track already added
@@ -569,7 +572,13 @@ func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Confi
 			}
 
 			s.log.Errorf(">>>>>> Calling client.onTrack 111")
-			client.onTrack(track)
+
+			if client.onTrack != nil {
+				s.log.Errorf(">>>>>> Calling client.onTrack is not null 111")
+				client.onTrack(track)
+			}
+
+			s.log.Errorf(">>>>>> Calling client.onTrack after calling 111")
 			track.SetAsProcessed()
 		} else {
 			// simulcast
