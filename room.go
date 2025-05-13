@@ -68,6 +68,11 @@ type Room struct {
 	extensions              []IExtension
 	OnEvent                 func(event Event)
 	options                 RoomOptions
+	// audio injection support
+	audioPlayer  *AudioPlayer // single relay-track for hold or prompts
+	promptActive bool         // true when playing room-wide prompt
+	holdStates   map[string]bool
+	audioMu      sync.Mutex
 }
 
 type RoomOptions struct {
@@ -115,6 +120,8 @@ func newRoom(id, name string, sfu *SFU, kind string, opts RoomOptions) *Room {
 		extensions: make([]IExtension, 0),
 		kind:       kind,
 		options:    opts,
+		holdStates: make(map[string]bool),
+		audioMu:    sync.Mutex{},
 	}
 
 	sfu.OnClientRemoved(func(client *Client) {
@@ -287,6 +294,19 @@ func (r *Room) onClientJoined(client *Client) {
 	for _, ext := range r.extensions {
 		ext.OnClientAdded(r, client)
 	}
+
+	// auto-subscribe late joiners to current audioPlayer if applicable
+	r.audioMu.Lock()
+	defer r.audioMu.Unlock()
+
+	if r.audioPlayer == nil {
+		return
+	}
+
+	// subscribe if promptActive OR this client is the one being put on hold
+	if r.promptActive || r.holdStates[client.ID()] {
+		_ = client.SubscribeTracks([]SubscribeTrackRequest{{ClientID: r.audioPlayer.ClientID(), TrackID: r.audioPlayer.ID()}})
+	}
 }
 
 func (r *Room) OnClientJoined(callback func(client *Client)) {
@@ -428,5 +448,179 @@ func (r *Room) loopRecordStats() {
 		case <-ticker.C:
 			r.updateStats()
 		}
+	}
+}
+
+// HoldParticipant places the given client on hold. While on hold the participant only hears the hold music
+// and all other participants do not receive this participant's media.
+// musicURL points to an Opus-in-Ogg source (local path or http). If loop is true it repeats indefinitely.
+func (r *Room) HoldParticipant(targetID string, musicURL string, loop bool) error {
+	r.audioMu.Lock()
+	defer r.audioMu.Unlock()
+
+	if r.holdStates[targetID] {
+		return nil // already on hold
+	}
+
+	// If a room-wide prompt is playing, stop it first
+	if r.promptActive {
+		for _, c := range r.sfu.GetClients() {
+			_ = c.UnsubscribeTracks([]string{r.audioPlayer.ID()})
+		}
+		r.promptActive = false
+		// keep player for reuse
+	}
+
+	// Ensure we have a hold music player running
+	if r.audioPlayer == nil {
+		player, err := NewAudioPlayer(r.context, r.sfu, musicURL, loop)
+		if err != nil {
+			return err
+		}
+		r.audioPlayer = player
+	}
+
+	// Fetch target client
+	target, err := r.sfu.GetClient(targetID)
+	if err != nil {
+		return err
+	}
+
+	// 1. Unsubscribe target from everyone else
+	unsubscribeIDs := []string{}
+	for _, ct := range target.ClientTracks() {
+		unsubscribeIDs = append(unsubscribeIDs, ct.ID())
+	}
+	_ = target.UnsubscribeTracks(unsubscribeIDs)
+
+	// 2. Subscribe target to hold music
+	_ = target.SubscribeTracks([]SubscribeTrackRequest{{ClientID: r.audioPlayer.ClientID(), TrackID: r.audioPlayer.ID()}})
+
+	// 3. Tell every other participant to stop receiving target's media
+	for cid, c := range r.sfu.GetClients() {
+		if cid == targetID {
+			continue
+		}
+		unsub := []string{}
+		for _, t := range target.PublishedTracks() {
+			unsub = append(unsub, t.ID())
+		}
+		_ = c.UnsubscribeTracks(unsub)
+	}
+
+	r.holdStates[targetID] = true
+	return nil
+}
+
+// UnholdParticipant restores normal media flow for the participant previously on hold.
+func (r *Room) UnholdParticipant(targetID string) error {
+	r.audioMu.Lock()
+	defer r.audioMu.Unlock()
+
+	if !r.holdStates[targetID] {
+		return nil // not on hold
+	}
+
+	target, err := r.sfu.GetClient(targetID)
+	if err != nil {
+		return err
+	}
+
+	// 1. Remove hold music track
+	_ = target.UnsubscribeTracks([]string{r.audioPlayer.ID()})
+
+	// 2. Resubscribe target to all available tracks (except its own)
+	sub := []SubscribeTrackRequest{}
+	for _, c := range r.sfu.GetClients() {
+		if c.ID() == targetID {
+			continue
+		}
+		for _, t := range c.PublishedTracks() {
+			sub = append(sub, SubscribeTrackRequest{ClientID: c.ID(), TrackID: t.ID()})
+		}
+	}
+	_ = target.SubscribeTracks(sub)
+
+	// 3. Ask others to resubscribe to target's published tracks
+	for cid, c := range r.sfu.GetClients() {
+		if cid == targetID {
+			continue
+		}
+		targetTracks := []SubscribeTrackRequest{}
+		for _, t := range target.PublishedTracks() {
+			targetTracks = append(targetTracks, SubscribeTrackRequest{ClientID: targetID, TrackID: t.ID()})
+		}
+		_ = c.SubscribeTracks(targetTracks)
+	}
+
+	delete(r.holdStates, targetID)
+
+	// If nobody is on hold stop the player to release bandwidth
+	if len(r.holdStates) == 0 && r.audioPlayer != nil {
+		r.audioPlayer.Stop()
+		r.audioPlayer = nil
+	}
+
+	return nil
+}
+
+// PlayAudio plays an audio file/URL to every active participant in the room. If loop is true the
+// clip repeats indefinitely until StopAudio is called. Subsequent calls while a clip is already
+// playing just add newly-joined participants to the subscription list.
+func (r *Room) PlayAudio(url string, loop bool) error {
+	r.audioMu.Lock()
+	defer r.audioMu.Unlock()
+
+	// If a prompt is already playing stop it first
+	if r.promptActive {
+		for _, c := range r.sfu.GetClients() {
+			_ = c.UnsubscribeTracks([]string{r.audioPlayer.ID()})
+		}
+		if len(r.holdStates) == 0 {
+			r.audioPlayer.Stop()
+			r.audioPlayer = nil
+		}
+		r.promptActive = false
+	}
+
+	// If we have no audioPlayer (or it was just cleaned) create a new one for this prompt
+	if r.audioPlayer == nil {
+		player, err := NewAudioPlayer(r.context, r.sfu, url, loop)
+		if err != nil {
+			return err
+		}
+		r.audioPlayer = player
+	}
+
+	r.promptActive = true
+
+	// Subscribe every connected client to the track
+	for _, c := range r.sfu.GetClients() {
+		// skip if already subscribed
+		already := false
+		for _, ct := range c.ClientTracks() {
+			if ct.ID() == r.audioPlayer.ID() {
+				already = true
+				break
+			}
+		}
+		if already {
+			continue
+		}
+		_ = c.SubscribeTracks([]SubscribeTrackRequest{{ClientID: r.audioPlayer.ClientID(), TrackID: r.audioPlayer.ID()}})
+	}
+
+	return nil
+}
+
+// StopAudio stops the room-wide audio playback and unsubscribes all participants.
+func (r *Room) StopAudio() {
+	r.audioMu.Lock()
+	defer r.audioMu.Unlock()
+
+	r.promptActive = false
+	if len(r.holdStates) == 0 {
+		r.audioPlayer.Stop()
+		r.audioPlayer = nil
 	}
 }

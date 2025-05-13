@@ -651,7 +651,7 @@ func (c *Client) Context() context.Context {
 
 // OnTrackAdded event is to confirmed the source type of the pending published tracks.
 // If the event is not listened, the pending published tracks will be ignored and not published to other clients.
-// Once received, respond with `client.SetTracksSourceType()“ to confirm the source type of the pending published tracks
+// Once received, respond with `client.SetTracksSourceType()" to confirm the source type of the pending published tracks
 func (c *Client) OnTracksAdded(callback func(addedTracks []ITrack)) {
 	c.muCallback.Lock()
 	defer c.muCallback.Unlock()
@@ -1944,4 +1944,61 @@ func (c *Client) onNetworkConditionChanged(condition networkmonitor.NetworkCondi
 	if c.onNetworkConditionChangedFunc != nil {
 		c.onNetworkConditionChangedFunc(condition)
 	}
+}
+
+// UnsubscribeTracks removes the provided track IDs from this client. It tears down the associated RTP
+// senders, frees bitrate claims and triggers renegotiation. If a trackID is not found it will be ignored.
+// This is the counter-part of SubscribeTracks and is primarily useful for advanced server side logic like
+// participant hold/unhold where we need to temporarily stop forwarding certain media streams.
+func (c *Client) UnsubscribeTracks(trackIDs []string) error {
+	// guard against nil slice
+	if len(trackIDs) == 0 {
+		return nil
+	}
+
+	// remove each track if present
+	for _, id := range trackIDs {
+		c.muTracks.Lock()
+		ct, ok := c.clientTracks[id]
+		if !ok {
+			c.muTracks.Unlock()
+			continue
+		}
+		// delete from map early to avoid races with push loops
+		delete(c.clientTracks, id)
+		c.muTracks.Unlock()
+
+		// Remove sender from PeerConnection
+		pc := c.peerConnection.PC()
+		var sender *webrtc.RTPSender
+		for _, s := range pc.GetSenders() {
+			if s.Track() != nil && s.Track().ID() == id {
+				sender = s
+				break
+			}
+		}
+		if sender != nil {
+			_ = pc.RemoveTrack(sender) // Ignore error, normal when renegotiation pending
+		}
+
+		// Remove bitrate claim & stats
+		if c.bitrateController != nil {
+			c.bitrateController.removeClaim(id)
+		}
+		if c.stats != nil {
+			c.stats.removeSenderStats(id)
+		}
+
+		// notify listeners that a track has gone
+		for _, cb := range c.onTrackRemovedCallbacks {
+			if ct != nil {
+				cb("", ct.LocalTrack())
+			}
+		}
+	}
+
+	// Trigger renegotiation if we are allowed to at this moment
+	go c.renegotiate(false)
+
+	return nil
 }
