@@ -67,22 +67,50 @@ func (m *Merger) MergeAll(ctx context.Context) (string, error) {
 	defer m.recordsLock.RUnlock()
 
 	if len(m.records) == 0 {
+		m.logger.Warnf("No recordings to merge")
 		return "", fmt.Errorf("no recordings to merge")
 	}
+
+	m.logger.Infof("Merging recordings from %d clients", len(m.records))
 
 	// Group files by ChannelType (left/right)
 	leftFiles := make([]TrackFile, 0)
 	rightFiles := make([]TrackFile, 0)
 
+	fileCount := 0
+	missingCount := 0
 	for clientID, metadataList := range m.records {
+		clientFileCount := 0
+		m.logger.Infof("Processing client %s with %d tracks", clientID, len(metadataList))
+
 		for _, metadata := range metadataList {
 			filePath := filepath.Join(m.config.BasePath, m.config.RecordingID, clientID, metadata.TrackID+".ogg")
+			fileCount++
 
 			if _, err := os.Stat(filePath); os.IsNotExist(err) {
-				m.logger.Warnf("File not found: %s", filePath)
+				m.logger.Warnf("File not found, skipping: %s", filePath)
+				missingCount++
 				continue
 			}
 
+			// Check if file is empty
+			fileInfo, err := os.Stat(filePath)
+			if err != nil {
+				m.logger.Warnf("Error checking file %s: %v", filePath, err)
+				missingCount++
+				continue
+			}
+
+			if fileInfo.Size() == 0 {
+				m.logger.Warnf("File is empty, skipping: %s", filePath)
+				missingCount++
+				continue
+			}
+
+			m.logger.Infof("Adding file: %s (size: %d bytes, channel type: %d)",
+				filePath, fileInfo.Size(), metadata.ChannelType)
+
+			clientFileCount++
 			trackFile := TrackFile{
 				Metadata: metadata,
 				FilePath: filePath,
@@ -94,6 +122,16 @@ func (m *Merger) MergeAll(ctx context.Context) (string, error) {
 				rightFiles = append(rightFiles, trackFile)
 			}
 		}
+
+		m.logger.Infof("Added %d files from client %s", clientFileCount, clientID)
+	}
+
+	m.logger.Infof("Found %d total files, %d missing or invalid, %d left channel, %d right channel",
+		fileCount, missingCount, len(leftFiles), len(rightFiles))
+
+	if len(leftFiles) == 0 && len(rightFiles) == 0 {
+		m.logger.Errorf("No valid files found to merge")
+		return "", fmt.Errorf("no valid files to merge")
 	}
 
 	// Sort files by start time
@@ -108,18 +146,36 @@ func (m *Merger) MergeAll(ctx context.Context) (string, error) {
 	// Ensure output directory exists
 	outputDir := filepath.Dir(m.config.OutputPath)
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		m.logger.Errorf("Failed to create output directory: %v", err)
 		return "", fmt.Errorf("failed to create output directory: %w", err)
 	}
 
 	// Generate FFmpeg command to merge files
 	ffmpegCmd, err := m.generateFFmpegCommand(leftFiles, rightFiles, m.config.OutputPath)
 	if err != nil {
+		m.logger.Errorf("Failed to generate FFmpeg command: %v", err)
 		return "", fmt.Errorf("failed to generate FFmpeg command: %w", err)
 	}
 
 	// Execute FFmpeg command to merge files
+	m.logger.Infof("Executing FFmpeg to merge files into: %s", m.config.OutputPath)
 	if err := executeFFmpegCommand(ctx, ffmpegCmd); err != nil {
+		m.logger.Errorf("Failed to merge files: %v", err)
 		return "", fmt.Errorf("failed to merge files: %w", err)
+	}
+
+	// Verify the output file was created
+	if _, err := os.Stat(m.config.OutputPath); os.IsNotExist(err) {
+		m.logger.Errorf("Output file was not created: %s", m.config.OutputPath)
+		return "", fmt.Errorf("output file was not created")
+	} else {
+		fileInfo, _ := os.Stat(m.config.OutputPath)
+		if fileInfo != nil {
+			m.logger.Infof("Successfully created merged file: %s (size: %d bytes)",
+				m.config.OutputPath, fileInfo.Size())
+		} else {
+			m.logger.Infof("Successfully created merged file: %s", m.config.OutputPath)
+		}
 	}
 
 	return m.config.OutputPath, nil

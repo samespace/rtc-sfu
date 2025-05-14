@@ -42,6 +42,8 @@ type remoteTrack struct {
 	recordingManager *recording.RecordingManager
 	clientID         string
 	trackID          string
+	packetCount      int
+	isRecording      bool
 }
 
 func newRemoteTrack(ctx context.Context, log logging.LeveledLogger, useBuffer bool, track IRemoteTrack, minWait, maxWait, pliInterval time.Duration, onPLI func(), statsGetter stats.Getter, onStatsUpdated func(*stats.Stats), onRead func(interceptor.Attributes, *rtp.Packet), pool *rtppool.RTPPool, onNetworkConditionChanged func(networkmonitor.NetworkConditionType)) *remoteTrack {
@@ -94,11 +96,19 @@ func (t *remoteTrack) SetRecordingManager(manager *recording.RecordingManager, c
 	t.recordingManager = manager
 	t.clientID = clientID
 	t.trackID = trackID
+
 	fmt.Printf("### RECORDING DEBUG: Successfully set recording manager for track %s, client %s\n", trackID, clientID)
 
 	// Verify recording is now possible
 	fmt.Printf("### RECORDING DEBUG: Recording manager status: %v, state: %d\n",
 		t.recordingManager != nil, t.recordingManager.GetState())
+	fmt.Printf("### RECORDING DEBUG: Track client ID: %s, track ID: %s\n", t.clientID, t.trackID)
+
+	// Try to create a recording if we're already receiving data
+	if t.packetCount > 0 && !t.isRecording && t.track.Kind() == webrtc.RTPCodecTypeAudio {
+		fmt.Printf("### RECORDING DEBUG: Already received %d packets, setting up recording now\n", t.packetCount)
+		t.isRecording = true
+	}
 }
 
 func (t *remoteTrack) readRTP() {
@@ -166,6 +176,8 @@ func (t *remoteTrack) readRTP() {
 			}
 
 			packetCount++
+			// Update track's packet count
+			t.packetCount = packetCount
 
 			// Log packet info every 500 packets
 			if t.isAudioTrack && packetCount%500 == 0 {
@@ -174,7 +186,7 @@ func (t *remoteTrack) readRTP() {
 			}
 
 			// Print periodic status for audio tracks regardless of recording status
-			if t.isAudioTrack && time.Since(lastStatusLogTime) > 10*time.Second {
+			if t.isAudioTrack && time.Since(lastStatusLogTime) > 5*time.Second {
 				t.mu.RLock()
 				clientID := t.clientID
 				trackID := t.trackID
@@ -187,7 +199,7 @@ func (t *remoteTrack) readRTP() {
 			}
 
 			// Handle recording for audio tracks
-			if t.isAudioTrack && t.recordingManager != nil {
+			if t.isAudioTrack {
 				t.mu.RLock()
 				clientID := t.clientID
 				trackID := t.trackID
@@ -217,27 +229,12 @@ func (t *remoteTrack) readRTP() {
 								recordedPacketCount, trackID, clientID, p.PayloadType, p.Timestamp, p.SequenceNumber)
 						}
 					}
-				} else if t.isAudioTrack && packetCount == 1 {
-					fmt.Printf("### RECORDING DEBUG: Cannot record - Missing recording info: clientID=%s, trackID=%s, manager=%v\n",
-						clientID, trackID, manager != nil)
-
-					// Add more detailed debugging
-					// Check if recordingManager is set but clientID or trackID is missing
+				} else if t.isAudioTrack && packetCount < 10 { // Only log for the first few packets
 					t.mu.RLock()
-					recordingManager := t.recordingManager
+					fmt.Printf("### RECORDING DEBUG: Cannot record packet #%d - Missing recording info: clientID=%s, trackID=%s, manager=%v\n",
+						packetCount, t.clientID, t.trackID, t.recordingManager != nil)
 					t.mu.RUnlock()
-
-					if recordingManager != nil {
-						fmt.Printf("### RECORDING DEBUG: Recording manager exists but track info missing. Manager state: %v\n",
-							recordingManager.GetState())
-					} else {
-						fmt.Printf("### RECORDING DEBUG: Recording manager is nil for audio track %s\n", t.track.ID())
-					}
 				}
-			} else if t.isAudioTrack && packetCount == 1 {
-				// Extra debugging for audio tracks that aren't being recorded
-				fmt.Printf("### RECORDING DEBUG: Audio track %s not being recorded, has recording manager: %v\n",
-					t.track.ID(), t.recordingManager != nil)
 			}
 
 			t.onRead(attrs, p)
@@ -331,7 +328,7 @@ func (t *remoteTrack) onEnded() {
 	}
 }
 
-// Enable recording directly from this track without relying on remoteTrackImpl
+// EnableDirectRecording directly sets up recording for this track without relying on remoteTrackImpl
 func (t *remoteTrack) EnableDirectRecording(manager *recording.RecordingManager, clientID, trackID string, sampleRate uint32) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -347,15 +344,15 @@ func (t *remoteTrack) EnableDirectRecording(manager *recording.RecordingManager,
 	t.clientID = clientID
 	t.trackID = trackID
 	t.isAudioTrack = true // Force audio recording for this track
+	t.isRecording = true  // Mark as recording
 
-	// Try to verify we can actually record
 	if manager.GetState() != recording.RecordingStateRecording {
 		fmt.Printf("### RECORDING DEBUG: Warning: Recording manager is not in recording state (state: %d)\n",
 			manager.GetState())
 	}
 
 	// Try to add the track to the recording manager
-	recorder, err := manager.AddTrack(clientID, trackID, 1, sampleRate) // Default to left channel
+	recorder, err := manager.AddTrack(clientID, trackID, 1 /* default to left channel */, sampleRate)
 	if err != nil {
 		fmt.Printf("### RECORDING DEBUG: Failed to add track to recording manager: %v\n", err)
 	} else {

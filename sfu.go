@@ -641,10 +641,48 @@ func (s *SFU) StopRecording() (string, error) {
 	outputPath := s.recordingManager.GetOutputPath()
 	fmt.Printf("### RECORDING DEBUG: Stopping recording with output path: %s\n", outputPath)
 
-	err := s.recordingManager.Stop()
+	// Get recording ID before stopping
+	recordingID := s.recordingManager.GetRecordingID()
+	recordingBasePath := s.recordingManager.GetBasePath()
+	recordingDir := filepath.Join(recordingBasePath, recordingID)
+
+	fmt.Printf("### RECORDING DEBUG: Checking content of recording directory: %s\n", recordingDir)
+	files, err := os.ReadDir(recordingDir)
+	if err != nil {
+		fmt.Printf("### RECORDING DEBUG: Error reading recording directory: %v\n", err)
+	} else {
+		fmt.Printf("### RECORDING DEBUG: Found %d entries in recording directory\n", len(files))
+		for _, file := range files {
+			info, _ := file.Info()
+			if info != nil {
+				fmt.Printf("### RECORDING DEBUG: File: %s, Size: %d bytes, IsDir: %v\n",
+					file.Name(), info.Size(), file.IsDir())
+			} else {
+				fmt.Printf("### RECORDING DEBUG: File: %s, IsDir: %v\n", file.Name(), file.IsDir())
+			}
+		}
+	}
+
+	fmt.Printf("### RECORDING DEBUG: Stopping recording manager...\n")
+	err = s.recordingManager.Stop()
 	if err != nil {
 		fmt.Printf("### RECORDING DEBUG: Error stopping recording: %v\n", err)
 		return outputPath, err
+	}
+
+	// Check if the merged file was created
+	if _, err := os.Stat(outputPath); os.IsNotExist(err) {
+		fmt.Printf("### RECORDING DEBUG: Merged file not found at: %s\n", outputPath)
+	} else if err != nil {
+		fmt.Printf("### RECORDING DEBUG: Error checking merged file: %v\n", err)
+	} else {
+		fileInfo, _ := os.Stat(outputPath)
+		if fileInfo != nil {
+			fmt.Printf("### RECORDING DEBUG: Merged file created: %s, Size: %d bytes\n",
+				outputPath, fileInfo.Size())
+		} else {
+			fmt.Printf("### RECORDING DEBUG: Merged file created: %s\n", outputPath)
+		}
 	}
 
 	fmt.Printf("### RECORDING DEBUG: Recording stopped successfully\n")

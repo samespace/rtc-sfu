@@ -433,3 +433,13 @@ func (m *RecordingManager) GetState() RecordingState {
 func (m *RecordingManager) GetOutputPath() string {
 	return m.outputPath
 }
+
+// GetRecordingID returns the recording ID
+func (m *RecordingManager) GetRecordingID() string {
+	return m.config.RecordingID
+}
+
+// GetBasePath returns the base path for recordings
+func (m *RecordingManager) GetBasePath() string {
+	return m.config.BasePath
+}
