@@ -84,6 +84,7 @@ func (t *remoteTrack) SetRecordingManager(manager *recording.RecordingManager, c
 	defer t.mu.Unlock()
 
 	fmt.Printf("### RECORDING DEBUG: Setting recording manager for track %s, client %s\n", trackID, clientID)
+	fmt.Printf("### RECORDING DEBUG: Track kind: %s, track ID: %s, SSRC: %d\n", t.track.Kind(), t.track.ID(), t.track.SSRC())
 
 	if manager == nil {
 		fmt.Printf("### RECORDING DEBUG: Received nil recording manager for track %s\n", trackID)
@@ -94,6 +95,10 @@ func (t *remoteTrack) SetRecordingManager(manager *recording.RecordingManager, c
 	t.clientID = clientID
 	t.trackID = trackID
 	fmt.Printf("### RECORDING DEBUG: Successfully set recording manager for track %s, client %s\n", trackID, clientID)
+
+	// Verify recording is now possible
+	fmt.Printf("### RECORDING DEBUG: Recording manager status: %v, state: %d\n",
+		t.recordingManager != nil, t.recordingManager.GetState())
 }
 
 func (t *remoteTrack) readRTP() {
@@ -110,6 +115,7 @@ func (t *remoteTrack) readRTP() {
 	recordedPacketCount := 0
 	errorCount := 0
 	lastErrorLogTime := time.Now()
+	lastStatusLogTime := time.Now()
 
 	if t.isAudioTrack {
 		fmt.Printf("### RECORDING DEBUG: Starting to read RTP for audio track: %s\n", t.track.ID())
@@ -165,6 +171,19 @@ func (t *remoteTrack) readRTP() {
 			if t.isAudioTrack && packetCount%500 == 0 {
 				fmt.Printf("### RECORDING DEBUG: Track %s: Processed %d packets, recorded %d packets, errors %d\n",
 					t.track.ID(), packetCount, recordedPacketCount, errorCount)
+			}
+
+			// Print periodic status for audio tracks regardless of recording status
+			if t.isAudioTrack && time.Since(lastStatusLogTime) > 10*time.Second {
+				t.mu.RLock()
+				clientID := t.clientID
+				trackID := t.trackID
+				hasRecordingManager := t.recordingManager != nil
+				t.mu.RUnlock()
+
+				fmt.Printf("### RECORDING DEBUG: Audio track %s status - client: %s, trackID: %s, hasManager: %v, packets: %d, recorded: %d\n",
+					t.track.ID(), clientID, trackID, hasRecordingManager, packetCount, recordedPacketCount)
+				lastStatusLogTime = time.Now()
 			}
 
 			// Handle recording for audio tracks
@@ -310,4 +329,39 @@ func (t *remoteTrack) onEnded() {
 	for _, f := range t.onEndedCallbacks {
 		f()
 	}
+}
+
+// Enable recording directly from this track without relying on remoteTrackImpl
+func (t *remoteTrack) EnableDirectRecording(manager *recording.RecordingManager, clientID, trackID string, sampleRate uint32) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	fmt.Printf("### RECORDING DEBUG: Enabling direct recording for track %s, client %s\n", trackID, clientID)
+
+	if manager == nil {
+		fmt.Printf("### RECORDING DEBUG: Cannot enable direct recording - manager is nil\n")
+		return
+	}
+
+	t.recordingManager = manager
+	t.clientID = clientID
+	t.trackID = trackID
+	t.isAudioTrack = true // Force audio recording for this track
+
+	// Try to verify we can actually record
+	if manager.GetState() != recording.RecordingStateRecording {
+		fmt.Printf("### RECORDING DEBUG: Warning: Recording manager is not in recording state (state: %d)\n",
+			manager.GetState())
+	}
+
+	// Try to add the track to the recording manager
+	recorder, err := manager.AddTrack(clientID, trackID, 1, sampleRate) // Default to left channel
+	if err != nil {
+		fmt.Printf("### RECORDING DEBUG: Failed to add track to recording manager: %v\n", err)
+	} else {
+		fmt.Printf("### RECORDING DEBUG: Successfully added track directly to recording manager, file: %s\n",
+			recorder.GetFilePath())
+	}
+
+	fmt.Printf("### RECORDING DEBUG: Direct recording enabled for track %s, client %s\n", trackID, clientID)
 }

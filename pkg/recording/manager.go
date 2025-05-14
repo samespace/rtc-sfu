@@ -285,6 +285,13 @@ func (m *RecordingManager) AddTrack(clientID, trackID string, channelType int, s
 		return nil, fmt.Errorf("track is configured not to be recorded")
 	}
 
+	// Validate channel type
+	if channelType != int(ChannelTypeLeft) && channelType != int(ChannelTypeRight) {
+		m.logger.Warnf("[RECORDING-DEBUG] Invalid channel type %d for track %s, defaulting to left channel",
+			channelType, trackID)
+		channelType = int(ChannelTypeLeft)
+	}
+
 	// Create recorder
 	dirPath := filepath.Join(m.config.BasePath, m.config.RecordingID, clientID)
 	m.logger.Infof("[RECORDING-DEBUG] Creating directory for client %s: %s", clientID, dirPath)
@@ -330,7 +337,7 @@ func (m *RecordingManager) AddTrack(clientID, trackID string, channelType int, s
 		}
 	}
 
-	m.logger.Infof("[RECORDING-DEBUG] Track %s added successfully to recording", trackID)
+	m.logger.Infof("[RECORDING-DEBUG] Track %s added successfully to recording (channel type: %d)", trackID, channelType)
 	return recorder, nil
 }
 

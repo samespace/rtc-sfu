@@ -1,12 +1,14 @@
 package recording
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/pion/logging"
@@ -134,6 +136,19 @@ func (m *Merger) generateFFmpegCommand(leftFiles, rightFiles []TrackFile, output
 		return nil, fmt.Errorf("no files to merge")
 	}
 
+	m.logger.Infof("Generating FFmpeg command with %d left channel files and %d right channel files",
+		len(leftFiles), len(rightFiles))
+
+	for i, file := range leftFiles {
+		m.logger.Infof("Left channel file %d: %s (client: %s, track: %s, start: %s)",
+			i, file.FilePath, file.Metadata.ClientID, file.Metadata.TrackID, file.Metadata.StartTime)
+	}
+
+	for i, file := range rightFiles {
+		m.logger.Infof("Right channel file %d: %s (client: %s, track: %s, start: %s)",
+			i, file.FilePath, file.Metadata.ClientID, file.Metadata.TrackID, file.Metadata.StartTime)
+	}
+
 	// Create a complex FFmpeg command that:
 	// 1. Aligns audio files based on timestamps
 	// 2. Mixes multiple files per channel if needed
@@ -160,16 +175,26 @@ func (m *Merger) generateFFmpegCommand(leftFiles, rightFiles []TrackFile, output
 	if len(leftFiles) > 0 {
 		// Calculate time offsets relative to the earliest file
 		earliestStart := leftFiles[0].Metadata.StartTime
+		for _, file := range leftFiles {
+			if file.Metadata.StartTime.Before(earliestStart) {
+				earliestStart = file.Metadata.StartTime
+			}
+		}
+
+		m.logger.Infof("Earliest start time for left channel: %s", earliestStart)
+
 		for i, file := range leftFiles {
-			delay := file.Metadata.StartTime.Sub(earliestStart).Seconds()
+			delay := file.Metadata.StartTime.Sub(earliestStart).Milliseconds()
 			if delay < 0 {
 				delay = 0
 			}
 
+			m.logger.Infof("Left file %d delay: %d ms", i, delay)
+
 			if i == 0 {
-				filterComplex += fmt.Sprintf("[0:a]adelay=%d|%d[l0];", int(delay*1000), int(delay*1000))
+				filterComplex += fmt.Sprintf("[0:a]adelay=%d|%d[l0];", delay, delay)
 			} else {
-				filterComplex += fmt.Sprintf("[%d:a]adelay=%d|%d[l%d];", i, int(delay*1000), int(delay*1000), i)
+				filterComplex += fmt.Sprintf("[%d:a]adelay=%d|%d[l%d];", i, delay, delay, i)
 			}
 		}
 
@@ -195,17 +220,27 @@ func (m *Merger) generateFFmpegCommand(leftFiles, rightFiles []TrackFile, output
 	if len(rightFiles) > 0 {
 		// Calculate time offsets relative to the earliest file
 		earliestStart := rightFiles[0].Metadata.StartTime
+		for _, file := range rightFiles {
+			if file.Metadata.StartTime.Before(earliestStart) {
+				earliestStart = file.Metadata.StartTime
+			}
+		}
+
+		m.logger.Infof("Earliest start time for right channel: %s", earliestStart)
+
 		for i, file := range rightFiles {
-			delay := file.Metadata.StartTime.Sub(earliestStart).Seconds()
+			delay := file.Metadata.StartTime.Sub(earliestStart).Milliseconds()
 			if delay < 0 {
 				delay = 0
 			}
 
+			m.logger.Infof("Right file %d delay: %d ms", i, delay)
+
 			offset := len(leftFiles) + i
 			if i == 0 {
-				filterComplex += fmt.Sprintf("[%d:a]adelay=%d|%d[r0];", offset, int(delay*1000), int(delay*1000))
+				filterComplex += fmt.Sprintf("[%d:a]adelay=%d|%d[r0];", offset, delay, delay)
 			} else {
-				filterComplex += fmt.Sprintf("[%d:a]adelay=%d|%d[r%d];", offset, int(delay*1000), int(delay*1000), i)
+				filterComplex += fmt.Sprintf("[%d:a]adelay=%d|%d[r%d];", offset, delay, delay, i)
 			}
 		}
 
@@ -236,15 +271,67 @@ func (m *Merger) generateFFmpegCommand(leftFiles, rightFiles []TrackFile, output
 	cmd = append(cmd, "-b:a", "128k")
 	cmd = append(cmd, outputPath)
 
+	m.logger.Infof("Generated FFmpeg command with %d arguments", len(cmd))
+	m.logger.Infof("FFmpeg filter complex: %s", filterComplex)
+
 	return cmd, nil
 }
 
 // executeFFmpegCommand runs the FFmpeg command to merge files
 func executeFFmpegCommand(ctx context.Context, cmd []string) error {
+	// Print the command for debugging
+	fmt.Printf("### RECORDING DEBUG: Executing FFmpeg command: %s\n", strings.Join(cmd, " "))
+
 	// Execute FFmpeg command using os/exec
 	execCmd := exec.CommandContext(ctx, cmd[0], cmd[1:]...)
-	execCmd.Stdout = os.Stdout
-	execCmd.Stderr = os.Stderr
 
-	return execCmd.Run()
+	// Create pipes for stdout and stderr
+	stdout, err := execCmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("failed to create stdout pipe: %w", err)
+	}
+
+	stderr, err := execCmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("failed to create stderr pipe: %w", err)
+	}
+
+	// Create a wait group to wait for the goroutines to finish
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Start the command
+	if err := execCmd.Start(); err != nil {
+		return fmt.Errorf("failed to start FFmpeg command: %w", err)
+	}
+
+	// Read stdout
+	go func() {
+		defer wg.Done()
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			fmt.Printf("### FFMPEG STDOUT: %s\n", scanner.Text())
+		}
+	}()
+
+	// Read stderr
+	go func() {
+		defer wg.Done()
+		scanner := bufio.NewScanner(stderr)
+		for scanner.Scan() {
+			fmt.Printf("### FFMPEG STDERR: %s\n", scanner.Text())
+		}
+	}()
+
+	// Wait for the command to finish
+	err = execCmd.Wait()
+	wg.Wait()
+
+	if err != nil {
+		fmt.Printf("### RECORDING DEBUG: FFmpeg command failed with error: %v\n", err)
+		return fmt.Errorf("FFmpeg command failed: %w", err)
+	}
+
+	fmt.Printf("### RECORDING DEBUG: FFmpeg command completed successfully\n")
+	return nil
 }
