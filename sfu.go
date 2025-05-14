@@ -478,126 +478,93 @@ func (s *SFU) AddRelayTrack(ctx context.Context, id, streamid, rid string, clien
 	return nil
 }
 
-// StartRecording starts recording for the room
-func (s *SFU) StartRecording(recordingID string, s3Config *recording.S3Config) error {
+// RecordingConfig contains configuration for recording a room
+type RecordingConfig struct {
+	BasePath    string
+	RecordingID string
+	S3Config    *recording.S3Config
+}
+
+// StartRecording starts recording for the current SFU
+func (s *SFU) StartRecording(roomID string, roomRecordingConfig RecordingConfig) error {
 	s.recordingManagerMu.Lock()
 	defer s.recordingManagerMu.Unlock()
 
-	fmt.Printf("### RECORDING DEBUG: Starting recording with ID: %s, basePath: %s\n", recordingID, s.recordingBasePath)
+	if roomID == "" {
+		return fmt.Errorf("roomID is required")
+	}
+
+	if roomRecordingConfig.BasePath == "" {
+		roomRecordingConfig.BasePath = s.recordingBasePath
+		fmt.Printf("### RECORDING DEBUG: Setting recording base path: %q\n", roomRecordingConfig.BasePath)
+	}
+
+	// If recording ID is not specified, use room ID
+	if roomRecordingConfig.RecordingID == "" {
+		roomRecordingConfig.RecordingID = roomID
+	}
+
+	fmt.Printf("### RECORDING DEBUG: Starting recording with ID: %s, basePath: %s\n",
+		roomRecordingConfig.RecordingID, roomRecordingConfig.BasePath)
 
 	// Check if already recording
 	if s.recordingManager != nil {
-		fmt.Printf("### RECORDING DEBUG: Cannot start recording - already recording with existing manager\n")
-		return fmt.Errorf("already recording")
-	}
-
-	// Check if base path is set
-	if s.recordingBasePath == "" {
-		fmt.Printf("### RECORDING DEBUG: Cannot start recording - recording base path is not set\n")
-		return fmt.Errorf("recording base path is not set")
-	}
-
-	// Get current working directory for debugging
-	cwd, err := os.Getwd()
-	if err != nil {
-		fmt.Printf("### RECORDING DEBUG: Failed to get current working directory: %v\n", err)
-	} else {
-		fmt.Printf("### RECORDING DEBUG: Current working directory: %s\n", cwd)
-	}
-
-	// Check if base path is absolute or relative
-	isAbsolute := filepath.IsAbs(s.recordingBasePath)
-	fmt.Printf("### RECORDING DEBUG: Recording base path is absolute: %v\n", isAbsolute)
-
-	// Resolve absolute path if needed
-	absBasePath := s.recordingBasePath
-	if !isAbsolute {
-		absBasePath, err = filepath.Abs(s.recordingBasePath)
+		fmt.Printf("### RECORDING DEBUG: Already recording. Stopping current recording first.\n")
+		_, err := s.StopRecording()
 		if err != nil {
-			fmt.Printf("### RECORDING DEBUG: Failed to resolve absolute path: %v\n", err)
-		} else {
-			fmt.Printf("### RECORDING DEBUG: Resolved absolute path: %s\n", absBasePath)
+			fmt.Printf("### RECORDING DEBUG: Error stopping current recording: %v\n", err)
 		}
-	}
-
-	// Check if directory is accessible and create if needed
-	recordingPath := filepath.Join(s.recordingBasePath, recordingID)
-	fmt.Printf("### RECORDING DEBUG: Checking/creating recording directory at: %s\n", recordingPath)
-	if err := os.MkdirAll(recordingPath, 0755); err != nil {
-		fmt.Printf("### RECORDING DEBUG: Failed to create recording directory: %v\n", err)
-		return fmt.Errorf("failed to create recording directory: %w", err)
-	}
-
-	// Verify directory permissions
-	if info, err := os.Stat(recordingPath); err != nil {
-		fmt.Printf("### RECORDING DEBUG: Failed to stat recording directory: %v\n", err)
-	} else {
-		fmt.Printf("### RECORDING DEBUG: Recording directory (%s) mode: %v\n", recordingPath, info.Mode())
-	}
-
-	// Try to write a test file to verify permissions
-	testFile := filepath.Join(recordingPath, "test_write.txt")
-	err = os.WriteFile(testFile, []byte("Testing write permissions"), 0644)
-	if err != nil {
-		fmt.Printf("### RECORDING DEBUG: Failed to write test file - possible permission issue: %v\n", err)
-	} else {
-		fmt.Printf("### RECORDING DEBUG: Successfully wrote test file at %s\n", testFile)
-		// Clean up test file
-		os.Remove(testFile)
 	}
 
 	// Create recording config
 	config := recording.RecordingConfig{
-		BasePath:         s.recordingBasePath,
-		RecordingID:      recordingID,
-		SampleRate:       48000, // Standard for WebRTC audio
-		ChannelCount:     1,     // Mono for individual recordings
-		UploadToS3:       s3Config != nil,
-		S3Config:         s3Config,
-		UploadMergedOnly: true, // Only upload merged file by default
+		BasePath:    roomRecordingConfig.BasePath,
+		RecordingID: roomRecordingConfig.RecordingID,
+		S3Config:    roomRecordingConfig.S3Config,
+		SampleRate:  48000, // Standard for WebRTC audio
 	}
 
-	fmt.Printf("### RECORDING DEBUG: Creating recording manager with config BasePath: %s, RecordingID: %s\n",
-		config.BasePath, config.RecordingID)
-
-	// Create recording manager
-	manager, err := recording.NewRecordingManager(s.context, config, s.log)
+	// Initialize the recording manager
+	mgr, err := recording.NewRecordingManager(s.context, config, s.log)
 	if err != nil {
-		fmt.Printf("### RECORDING DEBUG: Failed to create recording manager: %v\n", err)
 		return fmt.Errorf("failed to create recording manager: %w", err)
 	}
 
-	s.recordingManager = manager
 	fmt.Printf("### RECORDING DEBUG: Recording manager created successfully\n")
 
 	// Start recording
-	if err := manager.Start(); err != nil {
-		fmt.Printf("### RECORDING DEBUG: Failed to start recording: %v\n", err)
-		s.recordingManager = nil
+	if err := mgr.Start(); err != nil {
 		return fmt.Errorf("failed to start recording: %w", err)
 	}
 
+	// Set recording manager
+	s.recordingManager = mgr
+
 	fmt.Printf("### RECORDING DEBUG: Recording started successfully. Adding existing tracks...\n")
 
-	// Add existing audio tracks to recording
-	trackCount := 0
-	clientCount := 0
-	for _, client := range s.clients.GetClients() {
-		clientCount++
+	// Add all existing audio tracks from all connected clients
+	clients := s.clients.GetClients()
+	for clientID, client := range clients {
+		// Get the client's channel type
+		channelType := int(client.options.ChannelType)
 		fmt.Printf("### RECORDING DEBUG: Processing client %s, channel type: %d, state: %d\n",
-			client.ID(), client.options.ChannelType, client.peerConnection.PC().ConnectionState())
+			clientID, channelType, client.peerConnection.PC().ConnectionState())
 
+		// Skip clients with ChannelTypeNoRecord
+		if channelType == 0 {
+			fmt.Printf("### RECORDING DEBUG: Client %s has ChannelTypeNoRecord, skipping\n", clientID)
+			continue
+		}
+
+		// Add all audio tracks from this client
 		for _, track := range client.tracks.GetTracks() {
 			if track.Kind() == webrtc.RTPCodecTypeAudio {
-				fmt.Printf("### RECORDING DEBUG: Found audio track from client %s: %s\n",
-					client.ID(), track.ID())
-				trackCount++
-				s.addTrackToRecording(client.ID(), track)
+				fmt.Printf("### RECORDING DEBUG: Found audio track from client %s: %s\n", clientID, track.ID())
+				// Add to recording with the client's channel type
+				s.addTrackToRecording(clientID, track)
 			}
 		}
 	}
-
-	fmt.Printf("### RECORDING DEBUG: Added %d audio tracks from %d clients to recording\n", trackCount, clientCount)
 
 	return nil
 }
@@ -724,41 +691,7 @@ func (s *SFU) addTrackToRecording(clientID string, track ITrack) {
 
 	fmt.Printf("### RECORDING DEBUG: Adding track %s from client %s to recording\n", track.ID(), clientID)
 
-	// Find the remote track implementation
-	var remoteTrackImpl *remoteTrack
-
-	switch t := track.(type) {
-	case *AudioTrack:
-		fmt.Printf("### RECORDING DEBUG: Track %s is an AudioTrack\n", track.ID())
-		remoteTrackImpl = t.RemoteTrack()
-		if remoteTrackImpl != nil {
-			fmt.Printf("### RECORDING DEBUG: Successfully obtained remoteTrackImpl from AudioTrack for %s\n", track.ID())
-		} else {
-			fmt.Printf("### RECORDING DEBUG: Could not get remoteTrack from Track\n")
-		}
-	case *SimulcastTrack:
-		fmt.Printf("### RECORDING DEBUG: Track %s is a SimulcastTrack\n", track.ID())
-		// For simulcast, try to get the highest quality track first
-		remoteTrackImpl = t.GetRemoteTrack(QualityHigh)
-		if remoteTrackImpl == nil {
-			remoteTrackImpl = t.GetRemoteTrack(QualityMid)
-		}
-		if remoteTrackImpl == nil {
-			remoteTrackImpl = t.GetRemoteTrack(QualityLow)
-		}
-
-		if remoteTrackImpl != nil {
-			fmt.Printf("### RECORDING DEBUG: Successfully obtained remoteTrackImpl from SimulcastTrack for %s\n", track.ID())
-		} else {
-			fmt.Printf("### RECORDING DEBUG: Could not get any remoteTrack from SimulcastTrack\n")
-		}
-	default:
-		fmt.Printf("### RECORDING DEBUG: Unknown track type for recording: %T\n", track)
-		// Instead of returning, let's try to examine the track further
-		fmt.Printf("### RECORDING DEBUG: Track details - ID: %s, Kind: %s, StreamID: %s\n",
-			track.ID(), track.Kind(), track.StreamID())
-	}
-
+	// Determine channel type
 	client, err := s.clients.GetClient(clientID)
 	if err != nil {
 		fmt.Printf("### RECORDING DEBUG: Failed to find client %s for recording: %v\n", clientID, err)
@@ -782,63 +715,78 @@ func (s *SFU) addTrackToRecording(clientID string, track ITrack) {
 		channelType = 1
 	}
 
-	// Find the correct sample rate from the codec
+	// Find appropriate sample rate
 	sampleRate := uint32(48000) // Default to 48kHz
-	if remoteTrackImpl != nil && remoteTrackImpl.track != nil {
-		codec := remoteTrackImpl.track.Codec()
-		if codec.MimeType != "" {
-			sampleRate = codec.ClockRate
-			fmt.Printf("### RECORDING DEBUG: Track %s codec: %s, sample rate: %d\n", track.ID(), codec.MimeType, sampleRate)
-		} else {
-			fmt.Printf("### RECORDING DEBUG: Track %s has no codec MIME type\n", track.ID())
+
+	// Take a more direct approach to attach recording - try all possible ways
+
+	// First try the remoteTrack approach
+	var remoteTrackImpl *remoteTrack
+	switch t := track.(type) {
+	case *AudioTrack:
+		fmt.Printf("### RECORDING DEBUG: Track %s is an AudioTrack\n", track.ID())
+		remoteTrackImpl = t.RemoteTrack()
+	case *SimulcastTrack:
+		fmt.Printf("### RECORDING DEBUG: Track %s is a SimulcastTrack\n", track.ID())
+		// For simulcast, try to get the highest quality track first
+		remoteTrackImpl = t.GetRemoteTrack(QualityHigh)
+		if remoteTrackImpl == nil {
+			remoteTrackImpl = t.GetRemoteTrack(QualityMid)
 		}
-	} else {
-		fmt.Printf("### RECORDING DEBUG: Cannot get codec - remoteTrackImpl is nil or has nil track\n")
-		fmt.Printf("### RECORDING DEBUG: Using default sample rate of 48000\n")
+		if remoteTrackImpl == nil {
+			remoteTrackImpl = t.GetRemoteTrack(QualityLow)
+		}
 	}
 
-	// Add track to recording manager
+	// Add track to recording manager first to create the recorder
+	fmt.Printf("### RECORDING DEBUG: Creating recorder for track %s\n", track.ID())
 	recorder, err := s.recordingManager.AddTrack(clientID, track.ID(), channelType, sampleRate)
 	if err != nil {
 		fmt.Printf("### RECORDING DEBUG: Failed to add track %s to recording: %v\n", track.ID(), err)
 		return
-	} else {
-		fmt.Printf("### RECORDING DEBUG: Successfully added track %s to recording manager, path: %s\n",
-			track.ID(), recorder.GetFilePath())
 	}
+	fmt.Printf("### RECORDING DEBUG: Successfully created recorder at %s\n", recorder.GetFilePath())
 
-	// Set recording manager on remote track for packet routing
+	// Try both approaches to ensure the track is properly configured
+
+	// 1. If we found a remoteTrackImpl, set the recording manager on it
 	if remoteTrackImpl != nil {
 		fmt.Printf("### RECORDING DEBUG: Setting recording manager on remote track %s\n", track.ID())
 		remoteTrackImpl.SetRecordingManager(s.recordingManager, clientID, track.ID())
-		fmt.Printf("### RECORDING DEBUG: Successfully configured track %s from client %s for recording\n", track.ID(), clientID)
 
-		// Check if recordingManager is properly set after configuration
-		t := remoteTrackImpl
-		t.mu.RLock()
-		hasManager := t.recordingManager != nil
-		hasClientID := t.clientID != ""
-		hasTrackID := t.trackID != ""
-		t.mu.RUnlock()
-		fmt.Printf("### RECORDING DEBUG: Track after setup - has manager: %v, has clientID: %v, has trackID: %v\n",
-			hasManager, hasClientID, hasTrackID)
-	} else {
-		fmt.Printf("### RECORDING DEBUG: Cannot set recording manager - remoteTrackImpl is nil for track %s\n", track.ID())
-		fmt.Printf("### RECORDING DEBUG: Setting up direct packet interception through OnRead for track %s\n", track.ID())
+		// Verify the recording manager is set
+		remoteTrackImpl.mu.RLock()
+		hasManager := remoteTrackImpl.recordingManager != nil
+		hasClientID := remoteTrackImpl.clientID != ""
+		hasTrackID := remoteTrackImpl.trackID != ""
+		remoteTrackImpl.mu.RUnlock()
 
-		// Set up a direct packet interception
-		track.OnRead(func(_ interceptor.Attributes, packet *rtp.Packet, _ QualityLevel) {
-			// Send the packet directly to the recording manager
-			if s.recordingManager != nil {
-				err := s.recordingManager.WriteRTP(clientID, track.ID(), packet)
-				if err != nil && rand.Intn(100) == 0 { // Only log occasionally to avoid flooding
+		fmt.Printf("### RECORDING DEBUG: Track %s recording setup: hasManager=%v, hasClientID=%v, hasTrackID=%v\n",
+			track.ID(), hasManager, hasClientID, hasTrackID)
+	}
+
+	// 2. Also set up direct packet interception as fallback
+	fmt.Printf("### RECORDING DEBUG: Setting up direct packet interception for track %s\n", track.ID())
+	track.OnRead(func(_ interceptor.Attributes, packet *rtp.Packet, _ QualityLevel) {
+		// Send the packet directly to the recording manager
+		if s.recordingManager != nil {
+			if err := s.recordingManager.WriteRTP(clientID, track.ID(), packet); err != nil {
+				if rand.Intn(1000) == 0 { // Only log occasionally to avoid flooding
 					fmt.Printf("### RECORDING DEBUG: Direct recording failed for track %s: %v\n", track.ID(), err)
 				}
 			}
-		})
+		}
+	})
 
-		fmt.Printf("### RECORDING DEBUG: Packet interception set up for track %s\n", track.ID())
+	// 3. If it's an AudioTrack, also try EnableDirectRecording
+	if audioTrack, isAudio := track.(*AudioTrack); isAudio {
+		fmt.Printf("### RECORDING DEBUG: Using EnableDirectRecording for AudioTrack %s\n", track.ID())
+		if innerTrack := audioTrack.RemoteTrack(); innerTrack != nil {
+			innerTrack.EnableDirectRecording(s.recordingManager, clientID, track.ID(), sampleRate)
+		}
 	}
+
+	fmt.Printf("### RECORDING DEBUG: Track %s setup for recording completed\n", track.ID())
 }
 
 // Handle track added

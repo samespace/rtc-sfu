@@ -346,19 +346,32 @@ func (t *remoteTrack) EnableDirectRecording(manager *recording.RecordingManager,
 	t.isAudioTrack = true // Force audio recording for this track
 	t.isRecording = true  // Mark as recording
 
-	if manager.GetState() != recording.RecordingStateRecording {
-		fmt.Printf("### RECORDING DEBUG: Warning: Recording manager is not in recording state (state: %d)\n",
-			manager.GetState())
-	}
-
-	// Try to add the track to the recording manager
-	recorder, err := manager.AddTrack(clientID, trackID, 1 /* default to left channel */, sampleRate)
+	// Check if we already have a valid recorder
+	_, err := manager.AddTrack(clientID, trackID, 1 /* default to left channel */, sampleRate)
 	if err != nil {
 		fmt.Printf("### RECORDING DEBUG: Failed to add track to recording manager: %v\n", err)
-	} else {
-		fmt.Printf("### RECORDING DEBUG: Successfully added track directly to recording manager, file: %s\n",
-			recorder.GetFilePath())
+		return
 	}
 
-	fmt.Printf("### RECORDING DEBUG: Direct recording enabled for track %s, client %s\n", trackID, clientID)
+	// Verify setup
+	fmt.Printf("### RECORDING DEBUG: Direct recording enabled with manager=%v, clientID=%s, trackID=%s\n",
+		t.recordingManager != nil, t.clientID, t.trackID)
+
+	// Test write a dummy packet to initialize the recording pipeline
+	dummyPacket := &rtp.Packet{
+		Header: rtp.Header{
+			Version:        2,
+			PayloadType:    111,
+			SequenceNumber: 1000,
+			Timestamp:      1000,
+			SSRC:           1000,
+		},
+		Payload: []byte{0, 0, 0, 0},
+	}
+
+	if err := manager.WriteRTP(clientID, trackID, dummyPacket); err != nil {
+		fmt.Printf("### RECORDING DEBUG: Test packet write failed: %v\n", err)
+	} else {
+		fmt.Printf("### RECORDING DEBUG: Test packet write successful, recording should be active\n")
+	}
 }

@@ -41,9 +41,9 @@ const (
 	ClientTypeDownBridge = "downbridge"
 
 	// Channel types for stereo recording
-	ChannelTypeNoRecord = 0 // Do not record this participant
-	ChannelTypeLeft     = 1 // Left channel in stereo file
-	ChannelTypeRight    = 2 // Right channel in stereo file
+	ChannelTypeNoRecord ChannelType = iota
+	ChannelTypeLeft
+	ChannelTypeRight
 
 	QualityAudioRed = 11
 	QualityAudio    = 10

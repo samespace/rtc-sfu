@@ -3,13 +3,14 @@ package recording
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/pion/logging"
 )
@@ -84,101 +85,106 @@ func (m *Merger) MergeAll(ctx context.Context) (string, error) {
 		m.logger.Infof("Processing client %s with %d tracks", clientID, len(metadataList))
 
 		for _, metadata := range metadataList {
+			// Construct file path from client ID and track ID
 			filePath := filepath.Join(m.config.BasePath, m.config.RecordingID, clientID, metadata.TrackID+".ogg")
-			fileCount++
 
+			// Check if file exists
 			if _, err := os.Stat(filePath); os.IsNotExist(err) {
-				m.logger.Warnf("File not found, skipping: %s", filePath)
+				m.logger.Warnf("Recording file does not exist: %s", filePath)
 				missingCount++
 				continue
 			}
 
-			// Check if file is empty
-			fileInfo, err := os.Stat(filePath)
-			if err != nil {
-				m.logger.Warnf("Error checking file %s: %v", filePath, err)
-				missingCount++
-				continue
+			// Add to appropriate channel list based on ChannelType
+			switch metadata.ChannelType {
+			case 1: // Left channel
+				m.logger.Infof("Adding file %s to left channel", filePath)
+				leftFiles = append(leftFiles, TrackFile{
+					FilePath: filePath,
+					Metadata: metadata,
+				})
+				clientFileCount++
+			case 2: // Right channel
+				m.logger.Infof("Adding file %s to right channel", filePath)
+				rightFiles = append(rightFiles, TrackFile{
+					FilePath: filePath,
+					Metadata: metadata,
+				})
+				clientFileCount++
+			default:
+				m.logger.Warnf("Unsupported channel type %d for file %s",
+					metadata.ChannelType, filePath)
 			}
-
-			if fileInfo.Size() == 0 {
-				m.logger.Warnf("File is empty, skipping: %s", filePath)
-				missingCount++
-				continue
-			}
-
-			m.logger.Infof("Adding file: %s (size: %d bytes, channel type: %d)",
-				filePath, fileInfo.Size(), metadata.ChannelType)
-
-			clientFileCount++
-			trackFile := TrackFile{
-				Metadata: metadata,
-				FilePath: filePath,
-			}
-
-			if metadata.ChannelType == int(ChannelTypeLeft) {
-				leftFiles = append(leftFiles, trackFile)
-			} else if metadata.ChannelType == int(ChannelTypeRight) {
-				rightFiles = append(rightFiles, trackFile)
-			}
+			fileCount++
 		}
 
 		m.logger.Infof("Added %d files from client %s", clientFileCount, clientID)
 	}
 
-	m.logger.Infof("Found %d total files, %d missing or invalid, %d left channel, %d right channel",
-		fileCount, missingCount, len(leftFiles), len(rightFiles))
+	m.logger.Infof("Grouped %d files for merging (%d left, %d right), %d files missing",
+		fileCount, len(leftFiles), len(rightFiles), missingCount)
 
 	if len(leftFiles) == 0 && len(rightFiles) == 0 {
-		m.logger.Errorf("No valid files found to merge")
+		m.logger.Errorf("No valid files to merge")
 		return "", fmt.Errorf("no valid files to merge")
 	}
 
-	// Sort files by start time
-	sort.Slice(leftFiles, func(i, j int) bool {
-		return leftFiles[i].Metadata.StartTime.Before(leftFiles[j].Metadata.StartTime)
-	})
+	// Create merged file
+	outputPath := m.config.OutputPath
+	os.MkdirAll(filepath.Dir(outputPath), 0755)
 
-	sort.Slice(rightFiles, func(i, j int) bool {
-		return rightFiles[i].Metadata.StartTime.Before(rightFiles[j].Metadata.StartTime)
-	})
-
-	// Ensure output directory exists
-	outputDir := filepath.Dir(m.config.OutputPath)
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		m.logger.Errorf("Failed to create output directory: %v", err)
-		return "", fmt.Errorf("failed to create output directory: %w", err)
-	}
-
-	// Generate FFmpeg command to merge files
-	ffmpegCmd, err := m.generateFFmpegCommand(leftFiles, rightFiles, m.config.OutputPath)
+	// Generate and execute FFmpeg command
+	cmd, err := m.generateFFmpegCommand(leftFiles, rightFiles, outputPath)
 	if err != nil {
 		m.logger.Errorf("Failed to generate FFmpeg command: %v", err)
 		return "", fmt.Errorf("failed to generate FFmpeg command: %w", err)
 	}
 
-	// Execute FFmpeg command to merge files
-	m.logger.Infof("Executing FFmpeg to merge files into: %s", m.config.OutputPath)
-	if err := executeFFmpegCommand(ctx, ffmpegCmd); err != nil {
-		m.logger.Errorf("Failed to merge files: %v", err)
-		return "", fmt.Errorf("failed to merge files: %w", err)
+	// Execute the command
+	m.logger.Infof("Executing FFmpeg command: %s", strings.Join(cmd, " "))
+	err = executeFFmpegCommand(ctx, cmd)
+	if err != nil {
+		m.logger.Errorf("Failed to execute FFmpeg command: %v", err)
+		return "", fmt.Errorf("failed to execute FFmpeg command: %w", err)
 	}
 
-	// Verify the output file was created
-	if _, err := os.Stat(m.config.OutputPath); os.IsNotExist(err) {
-		m.logger.Errorf("Output file was not created: %s", m.config.OutputPath)
-		return "", fmt.Errorf("output file was not created")
+	m.logger.Infof("Successfully merged recordings to %s", outputPath)
+
+	// Save metadata for the merged file
+	type MergedMetadata struct {
+		LeftTracks  []TrackMetadata `json:"leftTracks"`
+		RightTracks []TrackMetadata `json:"rightTracks"`
+		MergedAt    time.Time       `json:"mergedAt"`
+		OutputPath  string          `json:"outputPath"`
+	}
+
+	mergedMeta := MergedMetadata{
+		MergedAt:   time.Now(),
+		OutputPath: outputPath,
+	}
+
+	for _, file := range leftFiles {
+		mergedMeta.LeftTracks = append(mergedMeta.LeftTracks, file.Metadata)
+	}
+
+	for _, file := range rightFiles {
+		mergedMeta.RightTracks = append(mergedMeta.RightTracks, file.Metadata)
+	}
+
+	metadataJSON, err := json.Marshal(mergedMeta)
+	if err != nil {
+		m.logger.Warnf("Failed to marshal merged metadata: %v", err)
 	} else {
-		fileInfo, _ := os.Stat(m.config.OutputPath)
-		if fileInfo != nil {
-			m.logger.Infof("Successfully created merged file: %s (size: %d bytes)",
-				m.config.OutputPath, fileInfo.Size())
+		metadataPath := outputPath + ".json"
+		err = os.WriteFile(metadataPath, metadataJSON, 0644)
+		if err != nil {
+			m.logger.Warnf("Failed to write merged metadata: %v", err)
 		} else {
-			m.logger.Infof("Successfully created merged file: %s", m.config.OutputPath)
+			m.logger.Infof("Saved merged metadata to %s", metadataPath)
 		}
 	}
 
-	return m.config.OutputPath, nil
+	return outputPath, nil
 }
 
 type TrackFile struct {
