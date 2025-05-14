@@ -2,6 +2,7 @@ package sfu
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -13,6 +14,12 @@ const (
 	StateRoomClosed     = "closed"
 	EventRoomClosed     = "room_closed"
 	EventRoomClientLeft = "room_client_left"
+)
+
+// Recording error definitions
+var (
+	ErrRecordingAlreadyStarted = errors.New("recording already started")
+	ErrRecordingNotStarted     = errors.New("recording not started")
 )
 
 type Options struct {
@@ -68,6 +75,7 @@ type Room struct {
 	extensions              []IExtension
 	OnEvent                 func(event Event)
 	options                 RoomOptions
+	recorder                *Recorder // audio recording manager
 }
 
 type RoomOptions struct {
@@ -412,6 +420,53 @@ func (r *Room) Meta() *Metadata {
 
 func (r *Room) Options() RoomOptions {
 	return r.options
+}
+
+// StartRecording initializes audio recording for the room with given options.
+func (r *Room) StartRecording(opts RecordingOptions) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.recorder != nil {
+		return ErrRecordingAlreadyStarted
+	}
+	r.recorder = newRecorder(r, opts)
+	return nil
+}
+
+// PauseRecording pauses the ongoing recording.
+func (r *Room) PauseRecording() error {
+	r.mu.RLock()
+	rec := r.recorder
+	r.mu.RUnlock()
+	if rec == nil {
+		return ErrRecordingNotStarted
+	}
+	rec.Pause()
+	return nil
+}
+
+// ResumeRecording resumes a previously paused recording.
+func (r *Room) ResumeRecording() error {
+	r.mu.RLock()
+	rec := r.recorder
+	r.mu.RUnlock()
+	if rec == nil {
+		return ErrRecordingNotStarted
+	}
+	rec.Resume()
+	return nil
+}
+
+// StopRecording stops recording, processes files, and uploads if configured.
+func (r *Room) StopRecording() error {
+	r.mu.Lock()
+	rec := r.recorder
+	r.recorder = nil
+	r.mu.Unlock()
+	if rec == nil {
+		return ErrRecordingNotStarted
+	}
+	return rec.Stop()
 }
 
 func (r *Room) loopRecordStats() {
