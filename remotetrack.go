@@ -2,6 +2,7 @@ package sfu
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"sync"
 	"time"
@@ -82,17 +83,17 @@ func (t *remoteTrack) SetRecordingManager(manager *recording.RecordingManager, c
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	t.log.Infof("[RECORDING-DEBUG] Setting recording manager for track %s, client %s", trackID, clientID)
+	fmt.Printf("### RECORDING DEBUG: Setting recording manager for track %s, client %s\n", trackID, clientID)
 
 	if manager == nil {
-		t.log.Errorf("[RECORDING-DEBUG] Received nil recording manager for track %s", trackID)
+		fmt.Printf("### RECORDING DEBUG: Received nil recording manager for track %s\n", trackID)
 		return
 	}
 
 	t.recordingManager = manager
 	t.clientID = clientID
 	t.trackID = trackID
-	t.log.Infof("[RECORDING-DEBUG] Successfully set recording manager for track %s, client %s", trackID, clientID)
+	fmt.Printf("### RECORDING DEBUG: Successfully set recording manager for track %s, client %s\n", trackID, clientID)
 }
 
 func (t *remoteTrack) readRTP() {
@@ -111,31 +112,33 @@ func (t *remoteTrack) readRTP() {
 	lastErrorLogTime := time.Now()
 
 	if t.isAudioTrack {
-		t.log.Infof("[RECORDING-DEBUG] Starting to read RTP for audio track: %s", t.track.ID())
+		fmt.Printf("### RECORDING DEBUG: Starting to read RTP for audio track: %s\n", t.track.ID())
 	}
 
 	for {
 		select {
 		case <-readCtx.Done():
 			if t.isAudioTrack {
-				t.log.Infof("[RECORDING-DEBUG] Stopped reading RTP for audio track: %s, processed %d packets, recorded %d packets, errors %d",
+				fmt.Printf("### RECORDING DEBUG: Stopped reading RTP for audio track: %s, processed %d packets, recorded %d packets, errors %d\n",
 					t.track.ID(), packetCount, recordedPacketCount, errorCount)
 			}
 			return
 		default:
 			if err := t.track.SetReadDeadline(time.Now().Add(1 * time.Second)); err != nil {
-				t.log.Errorf("[RECORDING-DEBUG] remotetrack: set read deadline error - %s", err.Error())
+				fmt.Printf("### RECORDING DEBUG: Set read deadline error - %s\n", err.Error())
 				return
 			}
 
 			n, attrs, readErr := t.track.Read(buffer)
 			if readErr != nil {
 				if readErr == io.EOF {
-					t.log.Infof("[RECORDING-DEBUG] remotetrack: track ended %s ", t.track.ID())
+					fmt.Printf("### RECORDING DEBUG: Track ended %s\n", t.track.ID())
 					return
 				}
 
-				t.log.Tracef("[RECORDING-DEBUG] remotetrack: read error: %s", readErr.Error())
+				if t.isAudioTrack && packetCount%100 == 0 {
+					fmt.Printf("### RECORDING DEBUG: Read error on audio track %s: %s\n", t.track.ID(), readErr.Error())
+				}
 				continue
 			}
 
@@ -147,7 +150,7 @@ func (t *remoteTrack) readRTP() {
 			p := t.rtppool.GetPacket()
 
 			if err := p.Unmarshal(buffer[:n]); err != nil {
-				t.log.Errorf("[RECORDING-DEBUG] remotetrack: unmarshal error: %s", err.Error())
+				fmt.Printf("### RECORDING DEBUG: Unmarshal error on track %s: %s\n", t.track.ID(), err.Error())
 				t.rtppool.PutPacket(p)
 				continue
 			}
@@ -158,9 +161,9 @@ func (t *remoteTrack) readRTP() {
 
 			packetCount++
 
-			// Log packet info every 1000 packets or once per minute
-			if packetCount%1000 == 0 {
-				t.log.Debugf("[RECORDING-DEBUG] Track %s: Processed %d packets, recorded %d packets, errors %d",
+			// Log packet info every 500 packets
+			if t.isAudioTrack && packetCount%500 == 0 {
+				fmt.Printf("### RECORDING DEBUG: Track %s: Processed %d packets, recorded %d packets, errors %d\n",
 					t.track.ID(), packetCount, recordedPacketCount, errorCount)
 			}
 
@@ -173,27 +176,31 @@ func (t *remoteTrack) readRTP() {
 				t.mu.RUnlock()
 
 				if clientID != "" && trackID != "" && manager != nil {
+					// Log first packet to be recorded
+					if recordedPacketCount == 0 {
+						fmt.Printf("### RECORDING DEBUG: First packet for track %s, client %s, PT: %d, TS: %d, seq: %d, payload size: %d\n",
+							trackID, clientID, p.PayloadType, p.Timestamp, p.SequenceNumber, len(p.Payload))
+					}
+
 					if err := manager.WriteRTP(clientID, trackID, p); err != nil {
 						errorCount++
 
 						// Log detailed error info but limit frequency to avoid flooding
 						if time.Since(lastErrorLogTime) > 5*time.Second {
-							t.log.Errorf("[RECORDING-DEBUG] Failed to write RTP packet to recorder: %v (packet #%d, total errors: %d)",
+							fmt.Printf("### RECORDING DEBUG: Failed to write RTP packet to recorder: %v (packet #%d, total errors: %d)\n",
 								err, packetCount, errorCount)
 							lastErrorLogTime = time.Now()
 						}
 					} else {
 						recordedPacketCount++
-						if recordedPacketCount%500 == 0 { // Log every 500 packets
-							t.log.Debugf("[RECORDING-DEBUG] Recorded %d packets for track %s, client %s, current packet PT: %d, TS: %d, seq: %d",
+						if recordedPacketCount == 1 || recordedPacketCount%500 == 0 {
+							fmt.Printf("### RECORDING DEBUG: Recorded %d packets for track %s, client %s, current packet PT: %d, TS: %d, seq: %d\n",
 								recordedPacketCount, trackID, clientID, p.PayloadType, p.Timestamp, p.SequenceNumber)
 						}
 					}
-				} else if t.isAudioTrack {
-					if packetCount == 1 || packetCount%500 == 0 { // First packet or every 500 packets
-						t.log.Warnf("[RECORDING-DEBUG] Missing recording info: clientID=%s, trackID=%s, manager=%v",
-							clientID, trackID, manager != nil)
-					}
+				} else if t.isAudioTrack && packetCount == 1 {
+					fmt.Printf("### RECORDING DEBUG: Cannot record - Missing recording info: clientID=%s, trackID=%s, manager=%v\n",
+						clientID, trackID, manager != nil)
 				}
 			}
 

@@ -80,12 +80,19 @@ func NewOggOpusRecorder(ctx context.Context, basePath, recordingID, clientID, tr
 	// Create path for the recording file
 	dirPath := filepath.Join(basePath, recordingID, clientID)
 	if err := os.MkdirAll(dirPath, 0755); err != nil {
-		logger.Errorf("[RECORDING-DEBUG] Failed to create directory for recorder: %v", err)
+		fmt.Printf("### RECORDING DEBUG: Failed to create directory for recorder: %v\n", err)
 		return nil, fmt.Errorf("failed to create directory: %w", err)
 	}
 
 	filePath := filepath.Join(dirPath, trackID+".opus")
-	logger.Infof("[RECORDING-DEBUG] Creating OggOpusRecorder for file: %s", filePath)
+	fmt.Printf("### RECORDING DEBUG: Creating OggOpusRecorder for file: %s\n", filePath)
+
+	// Check if directory is writeable
+	if info, err := os.Stat(dirPath); err != nil {
+		fmt.Printf("### RECORDING DEBUG: Failed to stat recording directory: %v\n", err)
+	} else {
+		fmt.Printf("### RECORDING DEBUG: Recording directory (%s) mode: %v\n", dirPath, info.Mode())
+	}
 
 	// Create metadata for this track
 	metadata := TrackMetadata{
@@ -105,9 +112,10 @@ func NewOggOpusRecorder(ctx context.Context, basePath, recordingID, clientID, tr
 		logger:       logger,
 		metadata:     metadata,
 		packetCount:  0,
+		serialNumber: uint32(time.Now().UnixNano() % 1000000),
 	}
 
-	logger.Infof("[RECORDING-DEBUG] OggOpusRecorder created successfully for track %s, client %s", trackID, clientID)
+	fmt.Printf("### RECORDING DEBUG: OggOpusRecorder created successfully for track %s, client %s\n", trackID, clientID)
 	return recorder, nil
 }
 
@@ -116,21 +124,21 @@ func (r *OggOpusRecorder) Start() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.logger.Infof("[RECORDING-DEBUG] Starting recorder for file: %s, current state: %v", r.filePath, r.state)
+	fmt.Printf("### RECORDING DEBUG: Starting recorder for file: %s, current state: %d\n", r.filePath, r.state)
 
 	if r.state != RecorderStateStopped {
-		r.logger.Infof("[RECORDING-DEBUG] Recorder already started or paused")
+		fmt.Printf("### RECORDING DEBUG: Recorder already started or paused\n")
 		return nil // Already started or paused
 	}
 
 	// Open the file for writing
 	file, err := os.Create(r.filePath)
 	if err != nil {
-		r.logger.Errorf("[RECORDING-DEBUG] Failed to create file for recording: %v, path: %s", err, r.filePath)
+		fmt.Printf("### RECORDING DEBUG: Failed to create file for recording: %v, path: %s\n", err, r.filePath)
 		return fmt.Errorf("failed to create file: %w", err)
 	}
 
-	r.logger.Infof("[RECORDING-DEBUG] Created file for recording: %s", r.filePath)
+	fmt.Printf("### RECORDING DEBUG: Created file for recording: %s\n", r.filePath)
 
 	r.file = file
 	r.state = RecorderStateRecording
@@ -139,13 +147,13 @@ func (r *OggOpusRecorder) Start() error {
 
 	// Write file headers
 	if err := r.writeHeaders(); err != nil {
-		r.logger.Errorf("[RECORDING-DEBUG] Failed to write headers: %v", err)
+		fmt.Printf("### RECORDING DEBUG: Failed to write headers: %v\n", err)
 		file.Close()
 		r.file = nil
 		return fmt.Errorf("failed to write headers: %w", err)
 	}
 
-	r.logger.Infof("[RECORDING-DEBUG] Recorder started successfully for file: %s", r.filePath)
+	fmt.Printf("### RECORDING DEBUG: Recorder started successfully for file: %s\n", r.filePath)
 	return nil
 }
 
@@ -180,11 +188,11 @@ func (r *OggOpusRecorder) Stop() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.logger.Infof("[RECORDING-DEBUG] Stopping recorder for file: %s, current state: %v, packets recorded: %d",
+	fmt.Printf("### RECORDING DEBUG: Stopping recorder for file: %s, current state: %d, packets recorded: %d\n",
 		r.filePath, r.state, r.packetCount)
 
 	if r.state == RecorderStateStopped {
-		r.logger.Infof("[RECORDING-DEBUG] Recorder already stopped")
+		fmt.Printf("### RECORDING DEBUG: Recorder already stopped\n")
 		return nil // Already stopped
 	}
 
@@ -195,13 +203,15 @@ func (r *OggOpusRecorder) Stop() error {
 	if r.file != nil {
 		// Write final page
 		if finalErr := r.writeOggPage(nil, false); finalErr != nil {
-			r.logger.Errorf("[RECORDING-DEBUG] Failed to write final page: %v", finalErr)
+			fmt.Printf("### RECORDING DEBUG: Failed to write final page: %v\n", finalErr)
 			err = finalErr
 		}
 
 		if closeErr := r.file.Close(); closeErr != nil && err == nil {
-			r.logger.Errorf("[RECORDING-DEBUG] Failed to close file: %v", closeErr)
+			fmt.Printf("### RECORDING DEBUG: Failed to close file: %v\n", closeErr)
 			err = closeErr
+		} else {
+			fmt.Printf("### RECORDING DEBUG: Successfully closed recording file: %s\n", r.filePath)
 		}
 		r.file = nil
 	}
@@ -210,13 +220,15 @@ func (r *OggOpusRecorder) Stop() error {
 	metadataPath := r.filePath + ".json"
 	r.metadata.StopTime = time.Now()
 	if metaErr := r.writeMetadata(metadataPath); metaErr != nil {
-		r.logger.Errorf("[RECORDING-DEBUG] Failed to write metadata: %v", metaErr)
+		fmt.Printf("### RECORDING DEBUG: Failed to write metadata: %v\n", metaErr)
 		if err == nil {
 			err = metaErr
 		}
+	} else {
+		fmt.Printf("### RECORDING DEBUG: Successfully wrote metadata file: %s\n", metadataPath)
 	}
 
-	r.logger.Infof("[RECORDING-DEBUG] Recorder stopped successfully for file: %s, duration: %v, packets: %d",
+	fmt.Printf("### RECORDING DEBUG: Recorder stopped successfully for file: %s, duration: %v, packets: %d\n",
 		r.filePath, r.metadata.StopTime.Sub(r.metadata.StartTime), r.packetCount)
 
 	return err
@@ -233,7 +245,9 @@ func (r *OggOpusRecorder) WriteRTP(packet *rtp.Packet) error {
 	}
 
 	if r.file == nil {
-		r.logger.Warnf("[RECORDING-DEBUG] Cannot write RTP packet - file is nil for file: %s", r.filePath)
+		if r.packetCount%100 == 0 { // Don't log too frequently
+			fmt.Printf("### RECORDING DEBUG: Cannot write RTP packet - file is nil for file: %s\n", r.filePath)
+		}
 		return fmt.Errorf("file is nil")
 	}
 
@@ -257,7 +271,7 @@ func (r *OggOpusRecorder) WriteRTP(packet *rtp.Packet) error {
 	if err := r.writeOggPage(opusPacket, false); err != nil {
 		// Only log errors occasionally to avoid flooding
 		if r.packetCount%100 == 0 {
-			r.logger.Errorf("[RECORDING-DEBUG] Failed to write RTP packet to file %s: %v", r.filePath, err)
+			fmt.Printf("### RECORDING DEBUG: Failed to write RTP packet to file %s: %v\n", r.filePath, err)
 		}
 		return fmt.Errorf("failed to write RTP packet: %w", err)
 	}
@@ -265,9 +279,9 @@ func (r *OggOpusRecorder) WriteRTP(packet *rtp.Packet) error {
 	r.packetCount++
 
 	// Log progress periodically
-	if r.packetCount == 1 || r.packetCount%1000 == 0 {
-		r.logger.Infof("[RECORDING-DEBUG] Written %d packets to file: %s, PT: %d",
-			r.packetCount, r.filePath, packet.PayloadType)
+	if r.packetCount == 1 || r.packetCount%500 == 0 {
+		fmt.Printf("### RECORDING DEBUG: Written %d packets to file: %s, PT: %d, file size: %d bytes\n",
+			r.packetCount, r.filePath, packet.PayloadType, r.getFileSize())
 	}
 
 	return nil
@@ -452,4 +466,17 @@ func (t *OggOpusTags) Marshal() []byte {
 	}
 
 	return data
+}
+
+// Helper to get file size
+func (r *OggOpusRecorder) getFileSize() int64 {
+	if r.file == nil {
+		return 0
+	}
+
+	info, err := r.file.Stat()
+	if err != nil {
+		return 0
+	}
+	return info.Size()
 }
