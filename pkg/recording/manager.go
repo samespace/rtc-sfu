@@ -3,6 +3,7 @@ package recording
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"sync"
@@ -52,13 +53,28 @@ type RecordingManager struct {
 func NewRecordingManager(ctx context.Context, config RecordingConfig, logger logging.LeveledLogger) (*RecordingManager, error) {
 	recordingCtx, cancel := context.WithCancel(ctx)
 
-	logger.Infof("[RECORDING] Creating new recording manager for recording ID: %s, in base path: %s",
+	logger.Infof("[RECORDING-DEBUG] Creating new recording manager for recording ID: %s, in base path: %s",
 		config.RecordingID, config.BasePath)
 
 	// Ensure base path exists
 	if err := os.MkdirAll(config.BasePath, 0755); err != nil {
-		logger.Errorf("[RECORDING] Failed to create base directory: %v", err)
+		logger.Errorf("[RECORDING-DEBUG] Failed to create base directory: %v", err)
 		return nil, fmt.Errorf("failed to create base directory: %w", err)
+	}
+
+	// Also create the recording ID subfolder
+	recordingPath := filepath.Join(config.BasePath, config.RecordingID)
+	if err := os.MkdirAll(recordingPath, 0755); err != nil {
+		logger.Errorf("[RECORDING-DEBUG] Failed to create recording directory: %v", err)
+		return nil, fmt.Errorf("failed to create recording directory: %w", err)
+	}
+
+	// Check directory permissions
+	if info, err := os.Stat(recordingPath); err != nil {
+		logger.Errorf("[RECORDING-DEBUG] Failed to stat recording directory: %v", err)
+		return nil, fmt.Errorf("failed to stat recording directory: %w", err)
+	} else {
+		logger.Infof("[RECORDING-DEBUG] Recording directory (%s) mode: %v", recordingPath, info.Mode())
 	}
 
 	manager := &RecordingManager{
@@ -79,25 +95,25 @@ func NewRecordingManager(ctx context.Context, config RecordingConfig, logger log
 		Logger:           logger,
 	}
 
-	logger.Infof("[RECORDING] Creating merger with output path: %s", mergerConfig.OutputPath)
+	logger.Infof("[RECORDING-DEBUG] Creating merger with output path: %s", mergerConfig.OutputPath)
 	manager.merger = NewMerger(recordingCtx, mergerConfig)
 	manager.outputPath = mergerConfig.OutputPath
 
 	// Initialize S3 uploader if needed
 	if config.UploadToS3 && config.S3Config != nil {
-		logger.Infof("[RECORDING] Initializing S3 uploader with endpoint: %s, bucket: %s",
+		logger.Infof("[RECORDING-DEBUG] Initializing S3 uploader with endpoint: %s, bucket: %s",
 			config.S3Config.Endpoint, config.S3Config.Bucket)
 		uploader, err := NewUploader(recordingCtx, *config.S3Config, logger)
 		if err != nil {
 			cancel()
-			logger.Errorf("[RECORDING] Failed to create S3 uploader: %v", err)
+			logger.Errorf("[RECORDING-DEBUG] Failed to create S3 uploader: %v", err)
 			return nil, fmt.Errorf("failed to create S3 uploader: %w", err)
 		}
 		manager.uploader = uploader
-		logger.Infof("[RECORDING] S3 uploader initialized successfully")
+		logger.Infof("[RECORDING-DEBUG] S3 uploader initialized successfully")
 	}
 
-	logger.Infof("[RECORDING] Recording manager created successfully")
+	logger.Infof("[RECORDING-DEBUG] Recording manager created successfully")
 	return manager, nil
 }
 
@@ -249,29 +265,42 @@ func (m *RecordingManager) AddTrack(clientID, trackID string, channelType int, s
 	m.recordersLock.Lock()
 	defer m.recordersLock.Unlock()
 
-	m.logger.Infof("[RECORDING] Adding track %s from client %s (channel type: %d, sample rate: %d)",
+	m.logger.Infof("[RECORDING-DEBUG] Adding track %s from client %s (channel type: %d, sample rate: %d)",
 		trackID, clientID, channelType, sampleRate)
 
 	// Check if already recording this track
 	if clientRecorders, exists := m.recorders[clientID]; exists {
 		if recorder, exists := clientRecorders[trackID]; exists {
-			m.logger.Infof("[RECORDING] Track %s from client %s is already being recorded", trackID, clientID)
+			m.logger.Infof("[RECORDING-DEBUG] Track %s from client %s is already being recorded", trackID, clientID)
 			return recorder, nil
 		}
 	} else {
 		m.recorders[clientID] = make(map[string]Recorder)
-		m.logger.Infof("[RECORDING] Created new recorder map for client %s", clientID)
+		m.logger.Infof("[RECORDING-DEBUG] Created new recorder map for client %s", clientID)
 	}
 
 	// Don't record tracks with ChannelTypeNoRecord
 	if channelType == int(ChannelTypeNoRecord) {
-		m.logger.Infof("[RECORDING] Track %s from client %s has ChannelTypeNoRecord, skipping", trackID, clientID)
+		m.logger.Infof("[RECORDING-DEBUG] Track %s from client %s has ChannelTypeNoRecord, skipping", trackID, clientID)
 		return nil, fmt.Errorf("track is configured not to be recorded")
 	}
 
 	// Create recorder
 	dirPath := filepath.Join(m.config.BasePath, m.config.RecordingID, clientID)
-	m.logger.Infof("[RECORDING] Creating directory for client %s: %s", clientID, dirPath)
+	m.logger.Infof("[RECORDING-DEBUG] Creating directory for client %s: %s", clientID, dirPath)
+
+	// Ensure the directory exists
+	if err := os.MkdirAll(dirPath, 0755); err != nil {
+		m.logger.Errorf("[RECORDING-DEBUG] Failed to create directory for client %s: %v", clientID, err)
+		return nil, fmt.Errorf("failed to create directory: %w", err)
+	}
+
+	// Check directory permissions
+	if info, err := os.Stat(dirPath); err != nil {
+		m.logger.Errorf("[RECORDING-DEBUG] Failed to stat client directory: %v", err)
+	} else {
+		m.logger.Infof("[RECORDING-DEBUG] Client directory mode: %v", info.Mode())
+	}
 
 	recorder, err := NewOggOpusRecorder(
 		m.context,
@@ -286,22 +315,22 @@ func (m *RecordingManager) AddTrack(clientID, trackID string, channelType int, s
 	)
 
 	if err != nil {
-		m.logger.Errorf("[RECORDING] Failed to create recorder for track %s: %v", trackID, err)
+		m.logger.Errorf("[RECORDING-DEBUG] Failed to create recorder for track %s: %v", trackID, err)
 		return nil, fmt.Errorf("failed to create recorder: %w", err)
 	}
 
-	m.logger.Infof("[RECORDING] Created recorder for track %s at %s", trackID, recorder.GetFilePath())
+	m.logger.Infof("[RECORDING-DEBUG] Created recorder for track %s at %s", trackID, recorder.GetFilePath())
 	m.recorders[clientID][trackID] = recorder
 
 	// Start recording if already in recording state
 	if m.state == RecordingStateRecording {
-		m.logger.Infof("[RECORDING] Starting recorder for track %s as manager is already recording", trackID)
+		m.logger.Infof("[RECORDING-DEBUG] Starting recorder for track %s as manager is already recording", trackID)
 		if err := recorder.Start(); err != nil {
-			m.logger.Errorf("[RECORDING] Failed to start recorder: %v", err)
+			m.logger.Errorf("[RECORDING-DEBUG] Failed to start recorder: %v", err)
 		}
 	}
 
-	m.logger.Infof("[RECORDING] Track %s added successfully to recording", trackID)
+	m.logger.Infof("[RECORDING-DEBUG] Track %s added successfully to recording", trackID)
 	return recorder, nil
 }
 
@@ -338,13 +367,28 @@ func (m *RecordingManager) WriteRTP(clientID, trackID string, packet *rtp.Packet
 	m.recordersLock.RLock()
 	defer m.recordersLock.RUnlock()
 
-	if clientRecorders, exists := m.recorders[clientID]; exists {
-		if recorder, exists := clientRecorders[trackID]; exists {
-			return recorder.WriteRTP(packet)
-		}
+	if m.state != RecordingStateRecording {
+		// Silently ignore packets when not recording
+		return nil
 	}
 
-	return fmt.Errorf("track not found")
+	if clientRecorders, exists := m.recorders[clientID]; exists {
+		if recorder, exists := clientRecorders[trackID]; exists {
+			err := recorder.WriteRTP(packet)
+			if err != nil {
+				// Log every 100 errors to avoid flooding
+				if rand.Intn(100) == 0 {
+					m.logger.Warnf("[RECORDING-DEBUG] Error writing RTP packet to recorder for client %s, track %s: %v",
+						clientID, trackID, err)
+				}
+			}
+			return err
+		}
+		m.logger.Warnf("[RECORDING-DEBUG] Track %s not found for client %s", trackID, clientID)
+		return fmt.Errorf("track not found")
+	}
+	m.logger.Warnf("[RECORDING-DEBUG] Client %s not found in recorders map", clientID)
+	return fmt.Errorf("client not found")
 }
 
 // GetState returns the current recording state
