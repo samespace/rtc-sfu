@@ -201,7 +201,24 @@ func (t *remoteTrack) readRTP() {
 				} else if t.isAudioTrack && packetCount == 1 {
 					fmt.Printf("### RECORDING DEBUG: Cannot record - Missing recording info: clientID=%s, trackID=%s, manager=%v\n",
 						clientID, trackID, manager != nil)
+
+					// Add more detailed debugging
+					// Check if recordingManager is set but clientID or trackID is missing
+					t.mu.RLock()
+					recordingManager := t.recordingManager
+					t.mu.RUnlock()
+
+					if recordingManager != nil {
+						fmt.Printf("### RECORDING DEBUG: Recording manager exists but track info missing. Manager state: %v\n",
+							recordingManager.GetState())
+					} else {
+						fmt.Printf("### RECORDING DEBUG: Recording manager is nil for audio track %s\n", t.track.ID())
+					}
 				}
+			} else if t.isAudioTrack && packetCount == 1 {
+				// Extra debugging for audio tracks that aren't being recorded
+				fmt.Printf("### RECORDING DEBUG: Audio track %s not being recorded, has recording manager: %v\n",
+					t.track.ID(), t.recordingManager != nil)
 			}
 
 			t.onRead(attrs, p)

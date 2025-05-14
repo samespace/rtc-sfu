@@ -646,6 +646,7 @@ func (s *SFU) addTrackToRecording(clientID string, track ITrack) {
 	}
 
 	fmt.Printf("### RECORDING DEBUG: Adding track %s from client %s to recording\n", track.ID(), clientID)
+	fmt.Printf("### RECORDING DEBUG: Track type details: %T\n", track)
 
 	// Find the remote track implementation
 	var remoteTrackImpl *remoteTrack
@@ -654,10 +655,21 @@ func (s *SFU) addTrackToRecording(clientID string, track ITrack) {
 	case *AudioTrack:
 		fmt.Printf("### RECORDING DEBUG: Track %s is an AudioTrack\n", track.ID())
 		remoteTrackImpl = t.RemoteTrack()
+		fmt.Printf("### RECORDING DEBUG: Remote track implementation: %v, nil? %v\n", remoteTrackImpl, remoteTrackImpl == nil)
+
 		if remoteTrackImpl == nil {
 			fmt.Printf("### RECORDING DEBUG: Failed to get remoteTrack from AudioTrack %s\n", track.ID())
+			// Try to inspect AudioTrack for debugging
+			fmt.Printf("### RECORDING DEBUG: AudioTrack details: streamID=%s\n",
+				t.StreamID())
 		} else {
 			fmt.Printf("### RECORDING DEBUG: Successfully obtained remoteTrackImpl for track %s\n", track.ID())
+			if remoteTrackImpl.track != nil {
+				fmt.Printf("### RECORDING DEBUG: RemoteTrack inner track exists: ID=%s\n",
+					remoteTrackImpl.track.ID())
+			} else {
+				fmt.Printf("### RECORDING DEBUG: RemoteTrack inner track is nil\n")
+			}
 		}
 	case *Track:
 		// Skip video tracks
@@ -695,7 +707,11 @@ func (s *SFU) addTrackToRecording(clientID string, track ITrack) {
 		if codec.MimeType != "" {
 			sampleRate = codec.ClockRate
 			fmt.Printf("### RECORDING DEBUG: Track %s codec: %s, sample rate: %d\n", track.ID(), codec.MimeType, sampleRate)
+		} else {
+			fmt.Printf("### RECORDING DEBUG: Track %s has no codec MIME type\n", track.ID())
 		}
+	} else {
+		fmt.Printf("### RECORDING DEBUG: Cannot get codec - remoteTrackImpl is nil or has nil track\n")
 	}
 
 	// Add track to recording manager
@@ -713,6 +729,17 @@ func (s *SFU) addTrackToRecording(clientID string, track ITrack) {
 		fmt.Printf("### RECORDING DEBUG: Setting recording manager on remote track %s\n", track.ID())
 		remoteTrackImpl.SetRecordingManager(s.recordingManager, clientID, track.ID())
 		fmt.Printf("### RECORDING DEBUG: Successfully configured track %s from client %s for recording\n", track.ID(), clientID)
+
+		// Check if recordingManager is properly set after configuration
+		t := remoteTrackImpl
+		t.mu.RLock()
+		hasManager := t.recordingManager != nil
+		hasClientID := t.clientID != ""
+		hasTrackID := t.trackID != ""
+		t.mu.RUnlock()
+		fmt.Printf("### RECORDING DEBUG: Track after setup - has manager: %v, has clientID: %v, has trackID: %v\n",
+			hasManager, hasClientID, hasTrackID)
+
 	} else {
 		fmt.Printf("### RECORDING DEBUG: Cannot set recording manager - remoteTrackImpl is nil for track %s\n", track.ID())
 	}

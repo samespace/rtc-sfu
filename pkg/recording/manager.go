@@ -369,6 +369,9 @@ func (m *RecordingManager) WriteRTP(clientID, trackID string, packet *rtp.Packet
 
 	if m.state != RecordingStateRecording {
 		// Silently ignore packets when not recording
+		if rand.Intn(1000) == 0 { // Log occasionally
+			fmt.Printf("### RECORDING DEBUG: Received packet but not recording (state: %d)\n", m.state)
+		}
 		return nil
 	}
 
@@ -378,16 +381,37 @@ func (m *RecordingManager) WriteRTP(clientID, trackID string, packet *rtp.Packet
 			if err != nil {
 				// Log every 100 errors to avoid flooding
 				if rand.Intn(100) == 0 {
-					m.logger.Warnf("[RECORDING-DEBUG] Error writing RTP packet to recorder for client %s, track %s: %v",
+					fmt.Printf("### RECORDING DEBUG: Error writing RTP packet to recorder for client %s, track %s: %v\n",
 						clientID, trackID, err)
 				}
 			}
 			return err
 		}
-		m.logger.Warnf("[RECORDING-DEBUG] Track %s not found for client %s", trackID, clientID)
+		fmt.Printf("### RECORDING DEBUG: Track %s not found for client %s\n", trackID, clientID)
+		fmt.Printf("### RECORDING DEBUG: Available tracks for client %s: %v\n", clientID,
+			func() []string {
+				tracks := make([]string, 0, len(clientRecorders))
+				for trackID := range clientRecorders {
+					tracks = append(tracks, trackID)
+				}
+				return tracks
+			}())
 		return fmt.Errorf("track not found")
 	}
-	m.logger.Warnf("[RECORDING-DEBUG] Client %s not found in recorders map", clientID)
+
+	// Check if client exists but has no tracks
+	if _, exists := m.recorders[clientID]; !exists {
+		fmt.Printf("### RECORDING DEBUG: Client %s not found in recorders map\n", clientID)
+		fmt.Printf("### RECORDING DEBUG: Available clients: %v\n",
+			func() []string {
+				clients := make([]string, 0, len(m.recorders))
+				for cID := range m.recorders {
+					clients = append(clients, cID)
+				}
+				return clients
+			}())
+	}
+
 	return fmt.Errorf("client not found")
 }
 
