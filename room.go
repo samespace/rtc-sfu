@@ -162,6 +162,11 @@ func (r *Room) Close() error {
 		return ErrRoomIsClosed
 	}
 
+	// Stop recording if it's active
+	if r.recorder != nil {
+		_ = r.StopRecording()
+	}
+
 	r.cancel()
 
 	r.sfu.Stop()
