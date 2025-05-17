@@ -448,7 +448,7 @@ func (r *Room) StartRecording(recordingId string, s3Config *audiorecorder.S3Conf
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if !r.options.RecordingEnabled || r.options.RecordingBasePath == "" {
+	if r.options.RecordingBasePath == "" {
 		return ErrRecordingNotEnabled
 	}
 
