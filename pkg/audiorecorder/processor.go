@@ -48,11 +48,14 @@ func (r *Recorder) processRecordings() error {
 		Logger:     nil,      // Use default logger
 	})
 
+	r.writeDebugLog("Starting audio processing")
+
 	// Get all tracks by channel
 	channelOne := make([]*Track, 0)
 	channelTwo := make([]*Track, 0)
 
-	for _, track := range r.tracks {
+	for trackKey, track := range r.tracks {
+		r.writeDebugLog(fmt.Sprintf("Processing track %s with channel type %d", trackKey, track.ChannelType))
 		switch track.ChannelType {
 		case ChannelOne:
 			channelOne = append(channelOne, track)
@@ -61,11 +64,15 @@ func (r *Recorder) processRecordings() error {
 		}
 	}
 
+	r.writeDebugLog(fmt.Sprintf("Found %d tracks for channel one and %d tracks for channel two",
+		len(channelOne), len(channelTwo)))
+
 	recordingPath := filepath.Join(r.basePath, r.recordingID)
 
 	// Create output directory for merged files
 	mergedPath := filepath.Join(recordingPath, "merged")
 	if err := os.MkdirAll(mergedPath, 0755); err != nil {
+		r.writeDebugLog(fmt.Sprintf("Failed to create merged directory: %v", err))
 		return fmt.Errorf("failed to create merged directory: %w", err)
 	}
 
@@ -78,8 +85,12 @@ func (r *Recorder) processRecordings() error {
 		go func() {
 			defer wg.Done()
 			mergedFile := filepath.Join(mergedPath, "channel_one.ogg")
+			r.writeDebugLog(fmt.Sprintf("Merging %d files for channel one", len(channelOne)))
 			if err := processor.mergeFiles(channelOne, mergedFile); err != nil {
+				r.writeDebugLog(fmt.Sprintf("Failed to merge channel one: %v", err))
 				errChan <- fmt.Errorf("failed to merge channel one: %w", err)
+			} else {
+				r.writeDebugLog(fmt.Sprintf("Successfully merged channel one to %s", mergedFile))
 			}
 		}()
 	}
@@ -89,8 +100,12 @@ func (r *Recorder) processRecordings() error {
 		go func() {
 			defer wg.Done()
 			mergedFile := filepath.Join(mergedPath, "channel_two.ogg")
+			r.writeDebugLog(fmt.Sprintf("Merging %d files for channel two", len(channelTwo)))
 			if err := processor.mergeFiles(channelTwo, mergedFile); err != nil {
+				r.writeDebugLog(fmt.Sprintf("Failed to merge channel two: %v", err))
 				errChan <- fmt.Errorf("failed to merge channel two: %w", err)
+			} else {
+				r.writeDebugLog(fmt.Sprintf("Successfully merged channel two to %s", mergedFile))
 			}
 		}()
 	}
@@ -110,33 +125,49 @@ func (r *Recorder) processRecordings() error {
 	channelOnePath := filepath.Join(mergedPath, "channel_one.ogg")
 	channelTwoPath := filepath.Join(mergedPath, "channel_two.ogg")
 
+	r.writeDebugLog(fmt.Sprintf("Creating final output file: %s", finalOutput))
+
 	if len(channelOne) > 0 && len(channelTwo) > 0 {
 		// Merge into stereo
+		r.writeDebugLog("Creating stereo file from both channels")
 		if err := processor.createStereoFile(channelOnePath, channelTwoPath, finalOutput); err != nil {
+			r.writeDebugLog(fmt.Sprintf("Failed to create stereo file: %v", err))
 			return fmt.Errorf("failed to create stereo file: %w", err)
 		}
+		r.writeDebugLog("Successfully created stereo file")
 	} else if len(channelOne) > 0 {
 		// Only channel one exists, use it as final output
+		r.writeDebugLog("Only channel one exists, copying to final output")
 		if err := os.Rename(channelOnePath, finalOutput); err != nil {
+			r.writeDebugLog(fmt.Sprintf("Failed to rename channel one to final output: %v", err))
 			return fmt.Errorf("failed to rename channel one to final output: %w", err)
 		}
 	} else if len(channelTwo) > 0 {
 		// Only channel two exists, use it as final output
+		r.writeDebugLog("Only channel two exists, copying to final output")
 		if err := os.Rename(channelTwoPath, finalOutput); err != nil {
+			r.writeDebugLog(fmt.Sprintf("Failed to rename channel two to final output: %v", err))
 			return fmt.Errorf("failed to rename channel two to final output: %w", err)
 		}
 	} else {
 		// No tracks were recorded
+		r.writeDebugLog("No tracks were recorded, nothing to process")
 		return nil
 	}
 
 	// Upload to S3 if configured
 	if r.s3Config != nil {
+		r.writeDebugLog("Uploading to S3")
 		if err := processor.uploadToS3(finalOutput, r.s3Config, r.recordingID); err != nil {
+			r.writeDebugLog(fmt.Sprintf("Failed to upload to S3: %v", err))
 			return fmt.Errorf("failed to upload to S3: %w", err)
 		}
+		r.writeDebugLog("Successfully uploaded to S3")
+	} else {
+		r.writeDebugLog("S3 not configured, skipping upload")
 	}
 
+	r.writeDebugLog("Processing recordings completed successfully")
 	return nil
 }
 
@@ -145,6 +176,20 @@ func (p *Processor) mergeFiles(tracks []*Track, outputFile string) error {
 	if len(tracks) == 0 {
 		return fmt.Errorf("no tracks to merge")
 	}
+
+	// Write tracks to a log file for debugging
+	logFile := outputFile + ".log"
+	logContent := fmt.Sprintf("Merging %d tracks:\n", len(tracks))
+	for i, track := range tracks {
+		fileInfo, err := os.Stat(track.FilePath)
+		fileSize := int64(0)
+		if err == nil {
+			fileSize = fileInfo.Size()
+		}
+		logContent += fmt.Sprintf("%d. Client: %s, Track: %s, File: %s, Size: %d bytes, Exists: %v\n",
+			i+1, track.ClientID, track.TrackID, track.FilePath, fileSize, fileSize > 0)
+	}
+	_ = os.WriteFile(logFile, []byte(logContent), 0644)
 
 	if len(tracks) == 1 {
 		// Just copy the single file
@@ -165,7 +210,9 @@ func (p *Processor) mergeFiles(tracks []*Track, outputFile string) error {
 	concatFile := outputFile + ".txt"
 	concatContent := ""
 	for _, track := range tracks {
-		concatContent += fmt.Sprintf("file '%s'\n", track.FilePath)
+		// Escape single quotes in file paths for ffmpeg
+		escapedPath := strings.ReplaceAll(track.FilePath, "'", "'\\''")
+		concatContent += fmt.Sprintf("file '%s'\n", escapedPath)
 	}
 
 	if err := os.WriteFile(concatFile, []byte(concatContent), 0644); err != nil {
@@ -183,9 +230,12 @@ func (p *Processor) mergeFiles(tracks []*Track, outputFile string) error {
 		outputFile,
 	)
 
-	output, err := cmd.CombinedOutput()
+	cmdOutput, err := cmd.CombinedOutput()
+	// Save ffmpeg output to a log file
+	_ = os.WriteFile(outputFile+".ffmpeg.log", cmdOutput, 0644)
+
 	if err != nil {
-		return fmt.Errorf("ffmpeg error: %w, output: %s", err, string(output))
+		return fmt.Errorf("ffmpeg error: %w, output: %s", err, string(cmdOutput))
 	}
 
 	return nil

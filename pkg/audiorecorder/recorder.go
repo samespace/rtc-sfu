@@ -96,6 +96,23 @@ func NewRecorder(basePath, roomID, recordingID string) *Recorder {
 	}
 }
 
+// Write a log message to a debug file in the recording directory
+func (r *Recorder) writeDebugLog(message string) {
+	if r.recordingID == "" {
+		return
+	}
+
+	debugPath := filepath.Join(r.basePath, r.recordingID, "debug.log")
+	f, err := os.OpenFile(debugPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	timestamp := time.Now().Format(time.RFC3339)
+	_, _ = f.WriteString(fmt.Sprintf("[%s] %s\n", timestamp, message))
+}
+
 // Start begins a new recording session
 func (r *Recorder) Start(s3Config *S3Config) error {
 	r.mu.Lock()
@@ -115,10 +132,13 @@ func (r *Recorder) Start(s3Config *S3Config) error {
 		return fmt.Errorf("failed to create recording directory: %w", err)
 	}
 
+	r.writeDebugLog(fmt.Sprintf("Starting recording for room %s with recording ID %s", r.roomID, r.recordingID))
+
 	// Initialize metadata file
 	metadataPath := filepath.Join(recordingPath, "metadata.json")
 	file, err := os.Create(metadataPath)
 	if err != nil {
+		r.writeDebugLog(fmt.Sprintf("Failed to create metadata file: %v", err))
 		return fmt.Errorf("failed to create metadata file: %w", err)
 	}
 	r.metadataFile = file
@@ -130,6 +150,7 @@ func (r *Recorder) Start(s3Config *S3Config) error {
 		Data:      r.roomID,
 	})
 
+	r.writeDebugLog("Recording started successfully")
 	return nil
 }
 
@@ -142,8 +163,12 @@ func (r *Recorder) Stop() error {
 		return fmt.Errorf("recording is not active")
 	}
 
+	r.writeDebugLog("Stopping recording")
+	r.writeDebugLog(fmt.Sprintf("Number of tracks: %d", len(r.tracks)))
+
 	// Close all track writers
-	for _, track := range r.tracks {
+	for trackKey, track := range r.tracks {
+		r.writeDebugLog(fmt.Sprintf("Closing track: %s", trackKey))
 		if track.Writer != nil {
 			track.Writer.Close()
 		}
@@ -158,14 +183,20 @@ func (r *Recorder) Stop() error {
 
 	// Save metadata file
 	if err := r.saveMetadata(); err != nil {
+		r.writeDebugLog(fmt.Sprintf("Failed to save metadata: %v", err))
 		return fmt.Errorf("failed to save metadata: %w", err)
 	}
 
+	r.writeDebugLog("Metadata saved successfully")
+
 	// Process the recordings (merge and upload)
+	r.writeDebugLog("Starting to process recordings")
 	if err := r.processRecordings(); err != nil {
+		r.writeDebugLog(fmt.Sprintf("Failed to process recordings: %v", err))
 		return fmt.Errorf("failed to process recordings: %w", err)
 	}
 
+	r.writeDebugLog("Recording processed successfully")
 	r.state = RecordingStopped
 	r.cancel()
 	return nil
@@ -306,7 +337,11 @@ func (r *Recorder) WriteRTPPacket(clientID, trackID string, packet *rtp.Packet) 
 	}
 
 	if track.Writer != nil {
-		return track.Writer.WriteRTP(packet)
+		err := track.Writer.WriteRTP(packet)
+		if err != nil {
+			r.writeDebugLog(fmt.Sprintf("Error writing RTP packet to track %s: %v", trackKey, err))
+		}
+		return err
 	}
 
 	return nil
@@ -345,16 +380,21 @@ func (r *Recorder) logEvent(event Event) {
 // saveMetadata writes all events to the metadata file
 func (r *Recorder) saveMetadata() error {
 	if r.metadataFile == nil {
+		r.writeDebugLog("Failed to save metadata: metadata file not initialized")
 		return fmt.Errorf("metadata file not initialized")
 	}
 
+	r.writeDebugLog(fmt.Sprintf("Saving %d events to metadata file", len(r.events)))
+
 	// Seek to beginning of file
 	if _, err := r.metadataFile.Seek(0, io.SeekStart); err != nil {
+		r.writeDebugLog(fmt.Sprintf("Failed to seek in metadata file: %v", err))
 		return err
 	}
 
 	// Truncate file
 	if err := r.metadataFile.Truncate(0); err != nil {
+		r.writeDebugLog(fmt.Sprintf("Failed to truncate metadata file: %v", err))
 		return err
 	}
 
@@ -362,8 +402,15 @@ func (r *Recorder) saveMetadata() error {
 	encoder := json.NewEncoder(r.metadataFile)
 	encoder.SetIndent("", "  ")
 	if err := encoder.Encode(r.events); err != nil {
+		r.writeDebugLog(fmt.Sprintf("Failed to encode events to JSON: %v", err))
 		return err
 	}
 
-	return r.metadataFile.Sync()
+	if err := r.metadataFile.Sync(); err != nil {
+		r.writeDebugLog(fmt.Sprintf("Failed to sync metadata file: %v", err))
+		return err
+	}
+
+	r.writeDebugLog("Metadata saved successfully")
+	return nil
 }
