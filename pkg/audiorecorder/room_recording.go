@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 // RoomRecorder manages recording for an entire room
@@ -175,4 +176,29 @@ func (r *RoomRecorder) SetRoomID(roomID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.roomID = roomID
+}
+
+// WriteDebugLog writes a debug log message
+func (r *RoomRecorder) WriteDebugLog(message string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.recorder != nil {
+		r.recorder.writeDebugLog(message)
+	} else {
+		// Create debug log in base directory if recorder not initialized yet
+		debugPath := filepath.Join(r.basePath, r.recordingID, "debug.log")
+
+		// Create directory if it doesn't exist
+		_ = os.MkdirAll(filepath.Dir(debugPath), 0755)
+
+		f, err := os.OpenFile(debugPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			return
+		}
+		defer f.Close()
+
+		timestamp := time.Now().Format(time.RFC3339)
+		_, _ = f.WriteString(fmt.Sprintf("[%s] %s\n", timestamp, message))
+	}
 }

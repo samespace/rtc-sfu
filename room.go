@@ -3,6 +3,7 @@ package sfu
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -467,6 +468,22 @@ func (r *Room) StartRecording(recordingId string, s3Config *audiorecorder.S3Conf
 	// Set the room ID
 	r.recorder.SetRoomID(r.id)
 
+	// Add a debug log with initial information
+	r.recorder.WriteDebugLog(fmt.Sprintf("Starting recording for room %s with ID %s", r.id, recordingId))
+
+	// Check if any existing clients have recording enabled
+	hasRecordingEnabledClients := false
+	for _, client := range r.sfu.GetClients() {
+		if client.options.RecordingChannelType > 0 {
+			hasRecordingEnabledClients = true
+			break
+		}
+	}
+
+	if !hasRecordingEnabledClients {
+		r.recorder.WriteDebugLog("WARNING: No clients have recording enabled (RecordingChannelType > 0). Make sure to set client.options.RecordingChannelType to 1 or 2 for clients you want to record.")
+	}
+
 	// Start recording
 	if err := r.recorder.StartRecording(s3Config); err != nil {
 		r.recorder = nil
@@ -477,6 +494,7 @@ func (r *Room) StartRecording(recordingId string, s3Config *audiorecorder.S3Conf
 	for _, client := range r.sfu.GetClients() {
 		if client.options.RecordingChannelType > 0 {
 			r.recorder.LogClientJoined(client.ID())
+			r.recorder.WriteDebugLog(fmt.Sprintf("Registering existing client %s with channel type %d", client.ID(), client.options.RecordingChannelType))
 			for _, track := range client.tracks.GetTracks() {
 				if track.Kind() == webrtc.RTPCodecTypeAudio {
 					// Get the sample rate from the codec
@@ -484,6 +502,7 @@ func (r *Room) StartRecording(recordingId string, s3Config *audiorecorder.S3Conf
 					if track.MimeType() == webrtc.MimeTypeOpus {
 						sampleRate = 48000 // Opus is always 48kHz
 					}
+					r.recorder.WriteDebugLog(fmt.Sprintf("Adding audio track %s from client %s with sample rate %d", track.ID(), client.ID(), sampleRate))
 					if err := r.recorder.AddTrack(
 						client.ID(),
 						track.ID(),
@@ -491,16 +510,24 @@ func (r *Room) StartRecording(recordingId string, s3Config *audiorecorder.S3Conf
 						audiorecorder.ChannelType(client.options.RecordingChannelType),
 					); err != nil {
 						r.SFU().log.Warnf("Failed to add track to recorder: %v", err)
+						r.recorder.WriteDebugLog(fmt.Sprintf("Failed to add track %s from client %s: %v", track.ID(), client.ID(), err))
+					} else {
+						r.recorder.WriteDebugLog(fmt.Sprintf("Successfully added track %s from client %s", track.ID(), client.ID()))
 					}
 				}
 			}
+		} else {
+			r.recorder.WriteDebugLog(fmt.Sprintf("Skipping client %s because RecordingChannelType is %d", client.ID(), client.options.RecordingChannelType))
 		}
 	}
 
-	// Set client join/leave handlers
+	// OnClientJoined handles when a client connects to the room
 	r.OnClientJoined(func(client *Client) {
 		if client.options.RecordingChannelType > 0 && r.recorder != nil {
 			r.recorder.LogClientJoined(client.ID())
+			r.recorder.WriteDebugLog(fmt.Sprintf("Client joined: %s with channel type %d", client.ID(), client.options.RecordingChannelType))
+		} else if r.recorder != nil {
+			r.recorder.WriteDebugLog(fmt.Sprintf("Client joined but skipped recording: %s with channel type %d", client.ID(), client.options.RecordingChannelType))
 		}
 	})
 
