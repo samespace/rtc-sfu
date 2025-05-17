@@ -50,21 +50,33 @@ func (r *RoomRecorder) StartRecording(s3Config *S3Config) error {
 // StopRecording stops the recording and processes the files
 func (r *RoomRecorder) StopRecording() error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	if r.recorder == nil {
+		r.mu.Unlock()
 		return fmt.Errorf("recording not in progress")
 	}
 
-	err := r.recorder.Stop()
-
-	// Clean up after successful upload
-	if err == nil && r.cleanupOnError {
-		r.cleanup()
-	}
-
+	recorder := r.recorder
 	r.recorder = nil
-	return err
+	r.mu.Unlock()
+
+	// Process the recording in a goroutine to avoid blocking
+	go func() {
+		err := recorder.Stop()
+
+		// Clean up after successful upload
+		if err == nil && r.cleanupOnError {
+			r.mu.Lock()
+			r.cleanup()
+			r.mu.Unlock()
+		}
+
+		if err != nil {
+			fmt.Printf("Error stopping recording: %v\n", err)
+		}
+	}()
+
+	return nil
 }
 
 // PauseRecording pauses the current recording

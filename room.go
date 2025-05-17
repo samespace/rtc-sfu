@@ -544,17 +544,25 @@ func (r *Room) StartRecording(recordingId string, s3Config *audiorecorder.S3Conf
 // StopRecording stops audio recording for the room
 func (r *Room) StopRecording() error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	if r.recorder == nil {
+		r.mu.Unlock()
 		return ErrRecordingNotStarted
 	}
 
-	err := r.recorder.StopRecording()
+	recorder := r.recorder
 	r.recorder = nil
+	r.mu.Unlock()
 
-	r.SFU().log.Infof("Room %s: Stopped recording", r.id)
-	return err
+	// Stop recording asynchronously
+	go func() {
+		if err := recorder.StopRecording(); err != nil {
+			r.SFU().log.Errorf("Room %s: Failed to stop recording: %v", r.id, err)
+		}
+	}()
+
+	r.SFU().log.Infof("Room %s: Stopping recording (processing in background)", r.id)
+	return nil
 }
 
 // PauseRecording pauses the current recording session
