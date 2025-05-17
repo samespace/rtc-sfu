@@ -2,9 +2,11 @@ package sfu
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
+	"github.com/inlivedev/sfu/pkg/audiorecorder"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -13,6 +15,12 @@ const (
 	StateRoomClosed     = "closed"
 	EventRoomClosed     = "room_closed"
 	EventRoomClientLeft = "room_client_left"
+)
+
+var (
+	ErrRecordingNotEnabled     = errors.New("room: recording not enabled")
+	ErrRecordingAlreadyStarted = errors.New("room: recording already started")
+	ErrRecordingNotStarted     = errors.New("room: recording not started")
 )
 
 type Options struct {
@@ -68,6 +76,7 @@ type Room struct {
 	extensions              []IExtension
 	OnEvent                 func(event Event)
 	options                 RoomOptions
+	recorder                *audiorecorder.RoomRecorder
 }
 
 type RoomOptions struct {
@@ -84,6 +93,9 @@ type RoomOptions struct {
 	QualityLevels []QualityLevel `json:"quality_levels,omitempty"`
 	// Configure the timeout in nanonseconds when the room is empty it will close after the timeout exceeded. Default is 5 minutes
 	EmptyRoomTimeout *time.Duration `json:"empty_room_timeout_ns,ompitempty" example:"300000000000" default:"300000000000"`
+	// Configure the recording options for the room
+	RecordingEnabled  bool   `json:"recording_enabled,omitempty"`
+	RecordingBasePath string `json:"recording_base_path,omitempty"`
 }
 
 func DefaultRoomOptions() RoomOptions {
@@ -429,4 +441,114 @@ func (r *Room) loopRecordStats() {
 			r.updateStats()
 		}
 	}
+}
+
+// StartRecording starts audio recording for the room
+func (r *Room) StartRecording(recordingId string, s3Config *audiorecorder.S3Config) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if !r.options.RecordingEnabled || r.options.RecordingBasePath == "" {
+		return ErrRecordingNotEnabled
+	}
+
+	if r.recorder != nil {
+		return ErrRecordingAlreadyStarted
+	}
+
+	// Create recorder
+	r.recorder = audiorecorder.NewRoomRecorder(r.options.RecordingBasePath, recordingId, true)
+
+	// Set the room ID
+	r.recorder.SetRoomID(r.id)
+
+	// Start recording
+	if err := r.recorder.StartRecording(s3Config); err != nil {
+		r.recorder = nil
+		return err
+	}
+
+	// Register existing clients
+	for _, client := range r.sfu.GetClients() {
+		if client.options.RecordingChannelType > 0 {
+			r.recorder.LogClientJoined(client.ID())
+			for _, track := range client.tracks.GetTracks() {
+				if track.Kind() == webrtc.RTPCodecTypeAudio {
+					// Get the sample rate from the codec
+					sampleRate := uint32(48000) // Default to 48kHz if we can't get the real rate
+					if track.MimeType() == webrtc.MimeTypeOpus {
+						sampleRate = 48000 // Opus is always 48kHz
+					}
+					if err := r.recorder.AddTrack(
+						client.ID(),
+						track.ID(),
+						sampleRate,
+						audiorecorder.ChannelType(client.options.RecordingChannelType),
+					); err != nil {
+						r.SFU().log.Warnf("Failed to add track to recorder: %v", err)
+					}
+				}
+			}
+		}
+	}
+
+	// Set client join/leave handlers
+	r.OnClientJoined(func(client *Client) {
+		if client.options.RecordingChannelType > 0 && r.recorder != nil {
+			r.recorder.LogClientJoined(client.ID())
+		}
+	})
+
+	r.OnClientLeft(func(client *Client) {
+		if r.recorder != nil {
+			r.recorder.LogClientLeft(client.ID())
+		}
+	})
+
+	r.SFU().log.Infof("Room %s: Started recording", r.id)
+	return nil
+}
+
+// StopRecording stops audio recording for the room
+func (r *Room) StopRecording() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.recorder == nil {
+		return ErrRecordingNotStarted
+	}
+
+	err := r.recorder.StopRecording()
+	r.recorder = nil
+
+	r.SFU().log.Infof("Room %s: Stopped recording", r.id)
+	return err
+}
+
+// PauseRecording pauses the current recording session
+func (r *Room) PauseRecording() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.recorder == nil {
+		return ErrRecordingNotStarted
+	}
+
+	err := r.recorder.PauseRecording()
+	r.SFU().log.Infof("Room %s: Paused recording", r.id)
+	return err
+}
+
+// ResumeRecording resumes the current recording session
+func (r *Room) ResumeRecording() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.recorder == nil {
+		return ErrRecordingNotStarted
+	}
+
+	err := r.recorder.ResumeRecording()
+	r.SFU().log.Infof("Room %s: Resumed recording", r.id)
+	return err
 }

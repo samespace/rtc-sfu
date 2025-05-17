@@ -66,6 +66,7 @@ type ITrack interface {
 	Relay(func(webrtc.SSRC, interceptor.Attributes, *rtp.Packet))
 	PayloadType() webrtc.PayloadType
 	OnEnded(func())
+	SampleRate() uint32
 }
 
 type Track struct {
@@ -129,7 +130,11 @@ func newTrack(ctx context.Context, client *Client, trackRemote IRemoteTrack, min
 		client.onNetworkConditionChanged(condition)
 	}
 
-	t.remoteTrack = newRemoteTrack(ctx, client.log, client.options.ReorderPackets, trackRemote, minWait, maxWait, pliInterval, onPLI, stats, onStatsUpdated, onRead, pool, onNetworkConditionChanged)
+	// We need to check if the recorder is attached to the client
+	// The implementation will require changes to how the SFU and Room are related
+	// For now, we'll just pass nil and a future update will implement proper recorder access
+
+	t.remoteTrack = newRemoteTrack(ctx, client.log, client.options.ReorderPackets, trackRemote, minWait, maxWait, pliInterval, onPLI, stats, onStatsUpdated, onRead, pool, onNetworkConditionChanged, client.ID(), nil)
 
 	var cancel context.CancelFunc
 
@@ -575,7 +580,7 @@ func (t *SimulcastTrack) AddRemoteTrack(track IRemoteTrack, minWait, maxWait tim
 
 	}
 
-	remoteTrack = newRemoteTrack(t.Context(), t.base.client.log, t.reordered, track, minWait, maxWait, t.pliInterval, onPLI, stats, onStatsUpdated, onRead, t.base.pool, t.onNetworkConditionChanged)
+	remoteTrack = newRemoteTrack(t.Context(), t.base.client.log, t.reordered, track, minWait, maxWait, t.pliInterval, onPLI, stats, onStatsUpdated, onRead, t.base.pool, t.onNetworkConditionChanged, t.base.client.ID(), nil)
 
 	switch quality {
 	case QualityHigh:
@@ -999,4 +1004,12 @@ func RIDToQuality(RID string) QualityLevel {
 	default:
 		return QualityLow
 	}
+}
+
+func (t *Track) SampleRate() uint32 {
+	return t.remoteTrack.track.Codec().ClockRate
+}
+
+func (t *SimulcastTrack) SampleRate() uint32 {
+	return t.remoteTrackHigh.track.Codec().ClockRate
 }

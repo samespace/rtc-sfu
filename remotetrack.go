@@ -8,12 +8,14 @@ import (
 
 	"sync/atomic"
 
+	"github.com/inlivedev/sfu/pkg/audiorecorder"
 	"github.com/inlivedev/sfu/pkg/networkmonitor"
 	"github.com/inlivedev/sfu/pkg/rtppool"
 	"github.com/pion/interceptor"
 	"github.com/pion/interceptor/pkg/stats"
 	"github.com/pion/logging"
 	"github.com/pion/rtp"
+	"github.com/pion/webrtc/v4"
 )
 
 type remoteTrack struct {
@@ -33,9 +35,11 @@ type remoteTrack struct {
 	onStatsUpdated        func(*stats.Stats)
 	log                   logging.LeveledLogger
 	rtppool               *rtppool.RTPPool
+	recorder              *audiorecorder.Recorder
+	clientID              string
 }
 
-func newRemoteTrack(ctx context.Context, log logging.LeveledLogger, useBuffer bool, track IRemoteTrack, minWait, maxWait, pliInterval time.Duration, onPLI func(), statsGetter stats.Getter, onStatsUpdated func(*stats.Stats), onRead func(interceptor.Attributes, *rtp.Packet), pool *rtppool.RTPPool, onNetworkConditionChanged func(networkmonitor.NetworkConditionType)) *remoteTrack {
+func newRemoteTrack(ctx context.Context, log logging.LeveledLogger, useBuffer bool, track IRemoteTrack, minWait, maxWait, pliInterval time.Duration, onPLI func(), statsGetter stats.Getter, onStatsUpdated func(*stats.Stats), onRead func(interceptor.Attributes, *rtp.Packet), pool *rtppool.RTPPool, onNetworkConditionChanged func(networkmonitor.NetworkConditionType), clientID string, recorder *audiorecorder.Recorder) *remoteTrack {
 	localctx, cancel := context.WithCancel(ctx)
 
 	rt := &remoteTrack{
@@ -54,6 +58,8 @@ func newRemoteTrack(ctx context.Context, log logging.LeveledLogger, useBuffer bo
 		onRead:                onRead,
 		log:                   log,
 		rtppool:               pool,
+		clientID:              clientID,
+		recorder:              recorder,
 	}
 
 	if pliInterval > 0 {
@@ -116,6 +122,17 @@ func (t *remoteTrack) readRTP() {
 
 			if !t.IsRelay() {
 				go t.updateStats()
+			}
+
+			// Send to recorder if it's an audio track and recorder is set
+			if t.recorder != nil && t.track.Kind() == webrtc.RTPCodecTypeAudio && t.clientID != "" {
+				// Make a copy of the packet since it will be returned to the pool
+				packetCopy := *p
+				go func() {
+					if err := t.recorder.WriteRTPPacket(t.clientID, t.track.ID(), &packetCopy); err != nil {
+						t.log.Debugf("remotetrack: error writing to recorder: %s", err.Error())
+					}
+				}()
 			}
 
 			t.onRead(attrs, p)

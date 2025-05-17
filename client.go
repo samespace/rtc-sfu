@@ -91,9 +91,14 @@ type ClientOptions struct {
 	JitterBufferMaxWait time.Duration `json:"jitter_buffer_max_wait"`
 	// On unstable network, the packets can be arrived unordered which may affected the nack and packet loss counts, set this to true to allow the SFU to handle reordered packet
 	ReorderPackets bool `json:"reorder_packets"`
-	Log            logging.LeveledLogger
-	settingEngine  webrtc.SettingEngine
-	qualityLevels  []QualityLevel
+	// RecordingChannelType determines which stereo channel this client's audio will be recorded to
+	// 0: ChannelUnknown - Don't record this client
+	// 1: ChannelOne - Left stereo channel
+	// 2: ChannelTwo - Right stereo channel
+	RecordingChannelType uint8 `json:"recording_channel_type"`
+	Log                  logging.LeveledLogger
+	settingEngine        webrtc.SettingEngine
+	qualityLevels        []QualityLevel
 }
 
 type internalDataMessage struct {
@@ -651,7 +656,7 @@ func (c *Client) Context() context.Context {
 
 // OnTrackAdded event is to confirmed the source type of the pending published tracks.
 // If the event is not listened, the pending published tracks will be ignored and not published to other clients.
-// Once received, respond with `client.SetTracksSourceType()“ to confirm the source type of the pending published tracks
+// Once received, respond with `client.SetTracksSourceType()" to confirm the source type of the pending published tracks
 func (c *Client) OnTracksAdded(callback func(addedTracks []ITrack)) {
 	c.muCallback.Lock()
 	defer c.muCallback.Unlock()
