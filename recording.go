@@ -131,15 +131,21 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 				// For RED packets, extract the primary payload before writing
 				primaryPacket, _, err := ExtractRedPackets(pkt)
 				if err != nil {
-					r.sfu.log.Warnf("recording: error extracting primary payload from RED packet: %v", err)
+					fmt.Printf("error extracting primary payload from RED packet: %v", err)
 					return
 				}
 				// Explicitly set the payload type to Opus (111) for the oggwriter
 				primaryPacket.Header.PayloadType = 111
-				_ = ow.WriteRTP(primaryPacket)
+				err = ow.WriteRTP(primaryPacket)
+				if err != nil {
+					fmt.Printf("error writing primary payload to OGG file: %v", err)
+				}
 			} else {
 				// For non-RED packets, write directly
-				_ = ow.WriteRTP(pkt)
+				err = ow.WriteRTP(pkt)
+				if err != nil {
+					fmt.Printf("error writing non-RED packet to OGG file: %v", err)
+				}
 			}
 		})
 		return nil
