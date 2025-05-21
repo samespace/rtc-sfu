@@ -69,7 +69,7 @@ type trackWriter struct {
 
 func (tw *trackWriter) process() {
 	defer close(tw.done)
-	defer tw.ow.Close()
+	// defer tw.ow.Close()
 
 	for pkt := range tw.packetChan {
 		tw.mu.Lock()
@@ -302,6 +302,7 @@ func (r *Room) StopRecording() error {
 						fmt.Printf("error writing final silence: %v", err)
 					}
 				}
+				tw.ow.Close()
 				tw.mu.Unlock()
 			}
 		}
