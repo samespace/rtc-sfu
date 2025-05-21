@@ -42,75 +42,16 @@ type RecordingConfig struct {
 	S3             S3Config
 }
 
-type trackBuffer struct {
-	writer          *oggwriter.OggWriter
-	lastPacket      *rtp.Packet
-	lastPacketTime  time.Time
-	mu              sync.Mutex
-	ticker          *time.Ticker
-	done            chan struct{}
-	sequenceNumber  uint16
-	timestamp       uint32
-	payloadType     uint8
-	sampleRate      uint32
-	clientID        string
-	trackID         string
-	silencePackets  uint64
-	regularPackets  uint64
-	lastBufferState string
-	debug           bool
-}
-
 type recordingSession struct {
 	id      string
 	cfg     RecordingConfig
 	writers map[string]map[string]*oggwriter.OggWriter // clientID -> trackID -> writer
-	buffers map[string]map[string]*trackBuffer         // clientID -> trackID -> buffer
 	mu      sync.Mutex
 	paused  bool
-	debug   bool
 	meta    struct {
 		StartTime time.Time
 		StopTime  time.Time
 		Events    []Event
-		Stats     map[string]map[string]BufferStats
-	}
-}
-
-type BufferStats struct {
-	SilencePackets uint64 `json:"silence_packets"`
-	RegularPackets uint64 `json:"regular_packets"`
-	Duration       string `json:"duration"`
-}
-
-// logBufferState logs the current buffer state if debug is enabled
-func (b *trackBuffer) logBufferState(state string, details string) {
-	if !b.debug {
-		return
-	}
-
-	b.lastBufferState = state
-	fmt.Printf("[Buffer %s:%s] State: %s - %s, Regular: %d, Silence: %d, SeqNum: %d, Timestamp: %d\n",
-		b.clientID, b.trackID, state, details, b.regularPackets, b.silencePackets, b.sequenceNumber, b.timestamp)
-}
-
-// generateSilencePacket creates an Opus silence packet with the given sequence number and timestamp
-func generateSilencePacket(sequenceNumber uint16, timestamp uint32, payloadType uint8) *rtp.Packet {
-	// Opus silence frame (2 bytes for Opus silence)
-	silencePayload := []byte{0xF8, 0xFF}
-
-	return &rtp.Packet{
-		Header: rtp.Header{
-			Version:        2,
-			Padding:        false,
-			Extension:      false,
-			Marker:         false,
-			PayloadType:    payloadType,
-			SequenceNumber: sequenceNumber,
-			Timestamp:      timestamp,
-			SSRC:           0, // Will be overwritten with the actual SSRC if needed
-		},
-		Payload: silencePayload,
 	}
 }
 
@@ -126,15 +67,12 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 		id:      id,
 		cfg:     cfg,
 		writers: make(map[string]map[string]*oggwriter.OggWriter),
-		buffers: make(map[string]map[string]*trackBuffer),
-		debug:   os.Getenv("RECORDING_DEBUG") == "true",
 	}
 	session.meta.StartTime = time.Now()
-	session.meta.Stats = make(map[string]map[string]BufferStats)
 
 	baseDir := filepath.Join(cfg.BasePath, id)
 	if err := os.MkdirAll(baseDir, 0755); err != nil {
-		return "", fmt.Errorf("failed to create recording directory: %w", err)
+		return "", err
 	}
 
 	// Record client join/leave events
@@ -167,12 +105,10 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 		}
 		if _, ok := session.writers[clientID]; !ok {
 			session.writers[clientID] = make(map[string]*oggwriter.OggWriter)
-			session.buffers[clientID] = make(map[string]*trackBuffer)
-			session.meta.Stats[clientID] = make(map[string]BufferStats)
 		}
 		trackDir := filepath.Join(baseDir, clientID)
 		if err := os.MkdirAll(trackDir, 0755); err != nil {
-			return fmt.Errorf("failed to create track directory for %s: %w", clientID, err)
+			return err
 		}
 		filePath := filepath.Join(trackDir, fmt.Sprintf("%s.ogg", track.ID()))
 
@@ -181,125 +117,107 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 
 		ow, err := oggwriter.New(filePath, sampleRate, channelCount)
 		if err != nil {
-			return fmt.Errorf("failed to create ogg writer: %w", err)
+			return err
 		}
 		session.writers[clientID][track.ID()] = ow
+		// Buffer incoming RTP packets for gap-filling
+		pktCh := make(chan *rtp.Packet, 128)
+		track.OnRead(func(attrs interceptor.Attributes, pkt *rtp.Packet, q QualityLevel) {
+			if session.paused {
+				return
+			}
+			// Handle RED (PT 63)
+			if pkt.PayloadType == 63 {
+				primaryPacket, _, err := ExtractRedPackets(pkt)
+				if err != nil {
+					fmt.Printf("error extracting primary payload from RED packet: %v", err)
+					return
+				}
+				primaryPacket.Header.PayloadType = 111
+				pktCh <- primaryPacket
+			} else {
+				pktCh <- pkt
+			}
+		})
 
-		// Initialize track buffer
-		buffer := &trackBuffer{
-			writer:         ow,
-			lastPacketTime: time.Now(),
-			ticker:         time.NewTicker(20 * time.Millisecond), // 20ms is standard for Opus
-			done:           make(chan struct{}),
-			sampleRate:     sampleRate,
-			payloadType:    111, // Opus payload type
-			clientID:       clientID,
-			trackID:        track.ID(),
-			debug:          session.debug,
-		}
-		buffer.logBufferState("INIT", "Buffer initialized")
-		session.buffers[clientID][track.ID()] = buffer
-
-		// Start the buffer processing goroutine
+		// Goroutine to write RTP packets with silence insertion
 		go func() {
-			timeDelta := uint32(sampleRate / 50) // 20ms worth of samples at the given sample rate
-			bufferStartTime := time.Now()
+			// Predefined 20ms Opus silence payload (comfort noise)
+			frameSize := int(sampleRate) * 20 / 1000
+			// Static 2-byte Opus CN frame for 20ms silence
+			silencePayload := []byte{0xF8, 0xFF, 0xFE}
 
+			// Ticker at frame interval
+			ticker := time.NewTicker(time.Duration(frameSize) * time.Second / time.Duration(sampleRate))
+			defer ticker.Stop()
+
+			var (
+				lastTS  uint32
+				lastSeq uint16
+				ssrc    uint32
+				version uint8
+				first   = true
+			)
 			for {
 				select {
-				case <-buffer.ticker.C:
-					buffer.mu.Lock()
-					now := time.Now()
-
-					// If no packet received for more than 20ms, generate silence
-					// Only generate silence if we've received at least one real packet before
-					if now.Sub(buffer.lastPacketTime) >= 20*time.Millisecond && !session.paused && buffer.lastPacket != nil {
-						// Generate silence packet with updated sequence number and timestamp
-						buffer.sequenceNumber++
-						buffer.timestamp += timeDelta
-						silencePacket := generateSilencePacket(buffer.sequenceNumber, buffer.timestamp, buffer.payloadType)
-						silencePacket.SSRC = buffer.lastPacket.SSRC
-
-						err := buffer.writer.WriteRTP(silencePacket)
-						if err != nil {
-							fmt.Printf("ERROR [Buffer %s:%s]: Failed to write silence packet: %v\n",
-								buffer.clientID, buffer.trackID, err)
-						} else {
-							buffer.silencePackets++
-							buffer.logBufferState("SILENCE", fmt.Sprintf("Gap: %v", now.Sub(buffer.lastPacketTime)))
+				case pkt := <-pktCh:
+					if first {
+						lastTS = pkt.Timestamp
+						lastSeq = pkt.SequenceNumber
+						ssrc = pkt.SSRC
+						version = pkt.Version
+						first = false
+					} else {
+						gap := int64(pkt.Timestamp) - int64(lastTS)
+						missing := int(gap) / frameSize
+						for i := 0; i < missing; i++ {
+							lastSeq++
+							lastTS += uint32(frameSize)
+							silencePkt := &rtp.Packet{
+								Header: rtp.Header{
+									Version:        version,
+									PayloadType:    111,
+									SequenceNumber: lastSeq,
+									Timestamp:      lastTS,
+									SSRC:           ssrc,
+								},
+								Payload: silencePayload,
+							}
+							if err := ow.WriteRTP(silencePkt); err != nil {
+								fmt.Printf("error writing silence packet: %v", err)
+							}
 						}
 					}
-					buffer.mu.Unlock()
-				case <-buffer.done:
-					// Calculate final stats before shutting down
-					buffer.mu.Lock()
-					duration := time.Since(bufferStartTime)
-					session.mu.Lock()
-					if _, ok := session.meta.Stats[buffer.clientID]; !ok {
-						session.meta.Stats[buffer.clientID] = make(map[string]BufferStats)
+					// Write the real packet
+					lastSeq = pkt.SequenceNumber
+					lastTS = pkt.Timestamp
+					if err := ow.WriteRTP(pkt); err != nil {
+						fmt.Printf("error writing real packet: %v", err)
 					}
-					session.meta.Stats[buffer.clientID][buffer.trackID] = BufferStats{
-						SilencePackets: buffer.silencePackets,
-						RegularPackets: buffer.regularPackets,
-						Duration:       duration.String(),
+				case <-ticker.C:
+					if first {
+						continue
 					}
-					session.mu.Unlock()
-					buffer.logBufferState("CLOSED", fmt.Sprintf("Duration: %v, Ratio: %.2f%%",
-						duration, float64(buffer.silencePackets)/float64(buffer.silencePackets+buffer.regularPackets)*100))
-					buffer.mu.Unlock()
-
-					buffer.ticker.Stop()
-					return
+					// Insert silence if no packet arrived in interval
+					lastSeq++
+					lastTS += uint32(frameSize)
+					silencePkt := &rtp.Packet{
+						Header: rtp.Header{
+							Version:        version,
+							PayloadType:    111,
+							SequenceNumber: lastSeq,
+							Timestamp:      lastTS,
+							SSRC:           ssrc,
+						},
+						Payload: silencePayload,
+					}
+					if err := ow.WriteRTP(silencePkt); err != nil {
+						fmt.Printf("error writing silence packet: %v", err)
+					}
 				}
 			}
 		}()
 
-		track.OnRead(func(attrs interceptor.Attributes, pkt *rtp.Packet, q QualityLevel) {
-			// Skip when paused
-			if session.paused {
-				return
-			}
-
-			buffer.mu.Lock()
-			defer buffer.mu.Unlock()
-
-			var packetToWrite *rtp.Packet
-
-			// Check if this is RED packet (PT 63) and extract primary Opus payload if needed
-			if pkt.PayloadType == 63 {
-				// For RED packets, extract the primary payload before writing
-				primaryPacket, _, err := ExtractRedPackets(pkt)
-				if err != nil {
-					fmt.Printf("ERROR [Buffer %s:%s]: Failed to extract primary payload from RED packet: %v\n",
-						buffer.clientID, buffer.trackID, err)
-					return
-				}
-				// Explicitly set the payload type to Opus (111) for the oggwriter
-				primaryPacket.Header.PayloadType = 111
-				packetToWrite = primaryPacket
-			} else {
-				packetToWrite = pkt
-			}
-
-			// Update buffer state
-			buffer.lastPacket = packetToWrite
-			buffer.lastPacketTime = time.Now()
-			buffer.sequenceNumber = packetToWrite.SequenceNumber
-			buffer.timestamp = packetToWrite.Timestamp
-			buffer.payloadType = packetToWrite.PayloadType
-
-			// Write the actual packet
-			err := buffer.writer.WriteRTP(packetToWrite)
-			if err != nil {
-				fmt.Printf("ERROR [Buffer %s:%s]: Failed to write packet to OGG file: %v\n",
-					buffer.clientID, buffer.trackID, err)
-			} else {
-				buffer.regularPackets++
-				if buffer.debug && buffer.regularPackets%1000 == 0 {
-					buffer.logBufferState("PACKET", fmt.Sprintf("Received %d regular packets", buffer.regularPackets))
-				}
-			}
-		})
 		return nil
 	}
 
@@ -365,25 +283,7 @@ func (r *Room) StopRecording() error {
 	}
 	session.mu.Lock()
 	session.meta.StopTime = time.Now()
-
-	if session.debug {
-		fmt.Printf("Stopping recording session %s, duration: %v\n",
-			session.id, session.meta.StopTime.Sub(session.meta.StartTime))
-	}
-
-	// Stop all buffer processing
-	for clientID, clientBuffers := range session.buffers {
-		for trackID, buffer := range clientBuffers {
-			if session.debug {
-				fmt.Printf("Closing buffer for client %s, track %s\n", clientID, trackID)
-			}
-			close(buffer.done)
-		}
-	}
 	session.mu.Unlock()
-
-	// Wait for a moment to ensure all buffer goroutines have processed their done signals
-	time.Sleep(100 * time.Millisecond)
 
 	// Close writers
 	for _, m := range session.writers {
