@@ -197,11 +197,8 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 				return
 			}
 
-			var writePkt *rtp.Packet
-			// Handle RED packets as before...
-			// Send to packetChan
 			select {
-			case tw.packetChan <- writePkt:
+			case tw.packetChan <- pkt:
 			default:
 				fmt.Println("packet buffer full, dropping packet")
 			}
