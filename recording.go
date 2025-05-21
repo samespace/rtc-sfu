@@ -112,24 +112,8 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 		}
 		filePath := filepath.Join(trackDir, fmt.Sprintf("%s.ogg", track.ID()))
 
-		// Use type switch to handle both Track and AudioTrack types
-		var codecParams webrtc.RTPCodecParameters
-		switch t := track.(type) {
-		case *Track:
-			codecParams = t.base.codec
-		case *AudioTrack:
-			codecParams = t.Track.base.codec
-		default:
-			r.sfu.log.Warnf("room: unknown track type: %T", track)
-			return nil
-		}
-
 		sampleRate := uint32(48000) // Default for Opus
 		channelCount := uint16(1)   // Default for Opus
-
-		if codecParams.ClockRate > 0 {
-			sampleRate = uint32(codecParams.ClockRate)
-		}
 
 		ow, err := oggwriter.New(filePath, sampleRate, channelCount)
 		if err != nil {
@@ -141,8 +125,22 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 			if session.paused {
 				return
 			}
-			pkt.Header.PayloadType = 111
-			_ = ow.WriteRTP(pkt)
+
+			// Check if this is RED packet (PT 63) and extract primary Opus payload if needed
+			if pkt.PayloadType == 63 {
+				// For RED packets, extract the primary payload before writing
+				primaryPacket, _, err := ExtractRedPackets(pkt)
+				if err != nil {
+					r.sfu.log.Warnf("recording: error extracting primary payload from RED packet: %v", err)
+					return
+				}
+				// Explicitly set the payload type to Opus (111) for the oggwriter
+				primaryPacket.Header.PayloadType = 111
+				_ = ow.WriteRTP(primaryPacket)
+			} else {
+				// For non-RED packets, write directly
+				_ = ow.WriteRTP(pkt)
+			}
 		})
 		return nil
 	}
