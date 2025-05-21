@@ -141,7 +141,20 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 			if session.paused {
 				return
 			}
-			_ = ow.WriteRTP(pkt)
+
+			// Check if this is RED packet (PT 63) and extract primary Opus payload if needed
+			if pkt.PayloadType == 63 {
+				// For RED packets, extract the primary payload before writing
+				primaryPacket, _, err := ExtractRedPackets(pkt)
+				if err != nil {
+					r.sfu.log.Warnf("recording: error extracting primary payload from RED packet: %v", err)
+					return
+				}
+				_ = ow.WriteRTP(primaryPacket)
+			} else {
+				// For non-RED packets, write directly
+				_ = ow.WriteRTP(pkt)
+			}
 		})
 		return nil
 	}
