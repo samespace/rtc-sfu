@@ -150,6 +150,8 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 					r.sfu.log.Warnf("recording: error extracting primary payload from RED packet: %v", err)
 					return
 				}
+				// Explicitly set the payload type to Opus (111) for the oggwriter
+				primaryPacket.Header.PayloadType = 111
 				_ = ow.WriteRTP(primaryPacket)
 			} else {
 				// For non-RED packets, write directly
