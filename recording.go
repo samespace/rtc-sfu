@@ -38,7 +38,7 @@ type S3Config struct {
 
 type RecordingConfig struct {
 	BasePath       string
-	ChannelMapping map[string]ChannelType // clientID -> channel type
+	ChannelMapping map[string]ChannelType
 	S3             S3Config
 }
 
@@ -111,7 +111,27 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 			return err
 		}
 		filePath := filepath.Join(trackDir, fmt.Sprintf("%s.ogg", track.ID()))
-		ow, err := oggwriter.New(filePath, 48000, 1)
+
+		// Use type switch to handle both Track and AudioTrack types
+		var codecParams webrtc.RTPCodecParameters
+		switch t := track.(type) {
+		case *Track:
+			codecParams = t.base.codec
+		case *AudioTrack:
+			codecParams = t.Track.base.codec
+		default:
+			r.sfu.log.Warnf("room: unknown track type: %T", track)
+			return nil
+		}
+
+		sampleRate := uint32(48000) // Default for Opus
+		channelCount := uint16(1)   // Default for Opus
+
+		if codecParams.ClockRate > 0 {
+			sampleRate = uint32(codecParams.ClockRate)
+		}
+
+		ow, err := oggwriter.New(filePath, sampleRate, channelCount)
 		if err != nil {
 			return err
 		}
