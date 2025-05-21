@@ -121,6 +121,9 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 		}
 		session.writers[clientID][track.ID()] = ow
 		track.OnRead(func(attrs interceptor.Attributes, pkt *rtp.Packet, q QualityLevel) {
+
+			fmt.Printf("received packet: %v", pkt)
+
 			// skip when paused
 			if session.paused {
 				return
