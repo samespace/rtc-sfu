@@ -108,6 +108,9 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 
 	// Helper to add a track writer for a given client and track
 	addWriter := func(clientID string, track ITrack) error {
+
+		fmt.Printf("adding writer for client %s, track %s", clientID, track.ID())
+
 		session.mu.Lock()
 		defer session.mu.Unlock()
 		channel := cfg.ChannelMapping[clientID]
@@ -125,6 +128,22 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 
 		sampleRate := uint32(48000) // Default for Opus
 		channelCount := uint16(1)   // Default for Opus
+
+		// Use type switch to handle both Track and AudioTrack types
+		var codecParams webrtc.RTPCodecParameters
+		switch t := track.(type) {
+		case *Track:
+			codecParams = t.base.codec
+		case *AudioTrack:
+			codecParams = t.Track.base.codec
+		default:
+			r.sfu.log.Warnf("room: unknown track type: %T", track)
+			return nil
+		}
+
+		if codecParams.ClockRate > 0 {
+			sampleRate = uint32(codecParams.ClockRate)
+		}
 
 		ow, err := oggwriter.New(filePath, sampleRate, channelCount)
 		if err != nil {
@@ -145,6 +164,20 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 
 			session.mu.Lock()
 			defer session.mu.Unlock()
+
+			// Check if this is RED packet (PT 63) and extract primary Opus payload if needed
+			// if pkt.PayloadType == 63 {
+			// 	// For RED packets, extract the primary payload before writing
+			// 	primaryPacket, _, err := ExtractRedPackets(pkt)
+			// 	if err != nil {
+			// 		r.sfu.log.Warnf("recording: error extracting primary payload from RED packet: %v", err)
+			// 		return
+			// 	}
+			// 	_ = ow.WriteRTP(primaryPacket)
+			// } else {
+			// 	// For non-RED packets, write directly
+			// 	_ = ow.WriteRTP(pkt)
+			// }
 
 			tw := session.writers[clientID][track.ID()]
 			const samplesPerPacket = 960 // 48000Hz * 0.02s
@@ -197,6 +230,8 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 			tw.lastSeqNum = pkt.SequenceNumber
 			tw.lastRTPTimestamp = pkt.Timestamp
 		})
+
+		fmt.Printf("added writer for client %s, track %s", clientID, track.ID())
 
 		return nil
 	}
