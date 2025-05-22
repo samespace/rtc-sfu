@@ -285,9 +285,9 @@ func (r *Room) StopRecording() error {
 	}
 
 	// Merge channels and upload to S3
-	// if err := r.mergeAndUpload(session); err != nil {
-	// 	return err
-	// }
+	if err := r.mergeAndUpload(session); err != nil {
+		return err
+	}
 
 	r.recordingMu.Lock()
 	r.recordingSession = nil
