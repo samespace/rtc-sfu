@@ -120,8 +120,6 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 			return err
 		}
 		session.writers[clientID][track.ID()] = ow
-		// Buffer incoming RTP packets for gap-filling
-		pktCh := make(chan *rtp.Packet, 128)
 		track.OnRead(func(attrs interceptor.Attributes, pkt *rtp.Packet, q QualityLevel) {
 			if session.paused {
 				return
@@ -134,89 +132,17 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 					return
 				}
 				primaryPacket.Header.PayloadType = 111
-				pktCh <- primaryPacket
+				err = ow.WriteRTP(primaryPacket)
+				if err != nil {
+					fmt.Printf("error writing primary packet: %v", err)
+				}
 			} else {
-				pktCh <- pkt
-			}
-		})
-
-		// Goroutine to write RTP packets with silence insertion
-		go func() {
-			// Predefined 20ms Opus silence payload (comfort noise)
-			frameSize := int(sampleRate) * 20 / 1000
-			// Static 2-byte Opus CN frame for 20ms silence
-			silencePayload := []byte{0xF8, 0xFF, 0xFE}
-
-			// Ticker at frame interval
-			ticker := time.NewTicker(time.Duration(frameSize) * time.Second / time.Duration(sampleRate))
-			defer ticker.Stop()
-
-			var (
-				lastTS  uint32
-				lastSeq uint16
-				ssrc    uint32
-				version uint8
-				first   = true
-			)
-			for {
-				select {
-				case pkt := <-pktCh:
-					if first {
-						lastTS = pkt.Timestamp
-						lastSeq = pkt.SequenceNumber
-						ssrc = pkt.SSRC
-						version = pkt.Version
-						first = false
-					} else {
-						gap := int64(pkt.Timestamp) - int64(lastTS)
-						missing := int(gap) / frameSize
-						for i := 0; i < missing; i++ {
-							lastSeq++
-							lastTS += uint32(frameSize)
-							silencePkt := &rtp.Packet{
-								Header: rtp.Header{
-									Version:        version,
-									PayloadType:    111,
-									SequenceNumber: lastSeq,
-									Timestamp:      lastTS,
-									SSRC:           ssrc,
-								},
-								Payload: silencePayload,
-							}
-							if err := ow.WriteRTP(silencePkt); err != nil {
-								fmt.Printf("error writing silence packet: %v", err)
-							}
-						}
-					}
-					// Write the real packet
-					lastSeq = pkt.SequenceNumber
-					lastTS = pkt.Timestamp
-					if err := ow.WriteRTP(pkt); err != nil {
-						fmt.Printf("error writing real packet: %v", err)
-					}
-				case <-ticker.C:
-					if first {
-						continue
-					}
-					// Insert silence if no packet arrived in interval
-					lastSeq++
-					lastTS += uint32(frameSize)
-					silencePkt := &rtp.Packet{
-						Header: rtp.Header{
-							Version:        version,
-							PayloadType:    111,
-							SequenceNumber: lastSeq,
-							Timestamp:      lastTS,
-							SSRC:           ssrc,
-						},
-						Payload: silencePayload,
-					}
-					if err := ow.WriteRTP(silencePkt); err != nil {
-						fmt.Printf("error writing silence packet: %v", err)
-					}
+				err = ow.WriteRTP(pkt)
+				if err != nil {
+					fmt.Printf("error writing packet: %v", err)
 				}
 			}
-		}()
+		})
 
 		return nil
 	}
