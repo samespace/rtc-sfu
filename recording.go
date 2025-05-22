@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -260,6 +261,24 @@ func (r *Room) mergeAndUpload(session *recordingSession) error {
 			continue
 		}
 		monoPath := filepath.Join(baseDir, fmt.Sprintf("mono_%d.ogg", ch))
+		if len(inputs) == 1 {
+			src := inputs[0]
+			inF, err := os.Open(src)
+			if err != nil {
+				return fmt.Errorf("copy file for channel %d failed: %v", ch, err)
+			}
+			defer inF.Close()
+			outF, err := os.Create(monoPath)
+			if err != nil {
+				return fmt.Errorf("copy file for channel %d failed: %v", ch, err)
+			}
+			defer outF.Close()
+			if _, err := io.Copy(outF, inF); err != nil {
+				return fmt.Errorf("copy file for channel %d failed: %v", ch, err)
+			}
+			monoFiles[ch] = monoPath
+			continue
+		}
 		args := []string{"-y"}
 		for _, in := range inputs {
 			args = append(args, "-i", in)
