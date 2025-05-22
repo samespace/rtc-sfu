@@ -125,24 +125,6 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 			if session.paused {
 				return
 			}
-			// // Handle RED (PT 63)
-			// if pkt.PayloadType == 63 {
-			// 	primaryPacket, _, err := ExtractRedPackets(pkt)
-			// 	if err != nil {
-			// 		fmt.Printf("error extracting primary payload from RED packet: %v", err)
-			// 		return
-			// 	}
-			// 	primaryPacket.Header.PayloadType = 111
-			// 	err = ow.WriteRTP(primaryPacket)
-			// 	if err != nil {
-			// 		fmt.Printf("error writing primary packet: %v", err)
-			// 	}
-			// } else {
-			// 	err = ow.WriteRTP(pkt)
-			// 	if err != nil {
-			// 		fmt.Printf("error writing packet: %v", err)
-			// 	}
-			// }
 
 			err = ow.WriteRTP(pkt)
 			if err != nil {
