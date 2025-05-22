@@ -46,7 +46,7 @@ type RecordingConfig struct {
 type recordingSession struct {
 	id      string
 	cfg     RecordingConfig
-	writers map[string]map[string]*oggwriter.OggWriter // clientID -> trackID -> writer
+	writers map[string]map[string]*trackWriter // clientID -> trackID -> writer
 	mu      sync.Mutex
 	paused  bool
 	meta    struct {
@@ -54,6 +54,14 @@ type recordingSession struct {
 		StopTime  time.Time
 		Events    []Event
 	}
+}
+
+type trackWriter struct {
+	writer           *oggwriter.OggWriter
+	lastPacketTime   time.Time
+	lastRTPTimestamp uint32
+	lastSeqNum       uint16
+	clockRate        uint32
 }
 
 // StartRecording begins recording audio tracks in the room according to the provided config.
@@ -67,7 +75,7 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 	session := &recordingSession{
 		id:      id,
 		cfg:     cfg,
-		writers: make(map[string]map[string]*oggwriter.OggWriter),
+		writers: make(map[string]map[string]*trackWriter),
 	}
 	session.meta.StartTime = time.Now()
 
@@ -105,7 +113,7 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 			return nil
 		}
 		if _, ok := session.writers[clientID]; !ok {
-			session.writers[clientID] = make(map[string]*oggwriter.OggWriter)
+			session.writers[clientID] = make(map[string]*trackWriter)
 		}
 		trackDir := filepath.Join(baseDir, clientID)
 		if err := os.MkdirAll(trackDir, 0755); err != nil {
@@ -120,16 +128,64 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 		if err != nil {
 			return err
 		}
-		session.writers[clientID][track.ID()] = ow
+		// Create trackWriter with proper clock rate
+		session.writers[clientID][track.ID()] = &trackWriter{
+			writer:           ow,
+			clockRate:        sampleRate, // 48000 for Opus
+			lastPacketTime:   time.Time{},
+			lastRTPTimestamp: 0,
+			lastSeqNum:       0,
+		}
 		track.OnRead(func(attrs interceptor.Attributes, pkt *rtp.Packet, q QualityLevel) {
 			if session.paused {
 				return
 			}
 
-			err = ow.WriteRTP(pkt)
-			if err != nil {
+			session.mu.Lock()
+			defer session.mu.Unlock()
+
+			tw := session.writers[clientID][track.ID()]
+			currentTime := time.Now()
+			packetDuration := 20 * time.Millisecond // Opus frame duration
+
+			if !tw.lastPacketTime.IsZero() {
+				gapDuration := currentTime.Sub(tw.lastPacketTime)
+				if gapDuration > packetDuration {
+					// Calculate number of missing packets
+					missingPackets := int(gapDuration / packetDuration)
+
+					// Generate missing sequence numbers and timestamps
+					for i := 0; i < missingPackets; i++ {
+						silentPkt := &rtp.Packet{
+							Header: rtp.Header{
+								Version:        2,
+								PayloadType:    pkt.PayloadType,
+								SequenceNumber: tw.lastSeqNum + 1,
+								Timestamp:      tw.lastRTPTimestamp + uint32(packetDuration.Seconds()*float64(tw.clockRate)),
+								SSRC:           pkt.SSRC,
+							},
+							Payload: []byte{0xFC}, // OPUS CNG payload
+						}
+
+						if err := tw.writer.WriteRTP(silentPkt); err != nil {
+							fmt.Printf("error writing silent packet: %v", err)
+							continue
+						}
+
+						tw.lastSeqNum = silentPkt.SequenceNumber
+						tw.lastRTPTimestamp = silentPkt.Timestamp
+					}
+				}
+			}
+
+			// Update track writer state
+			tw.lastPacketTime = currentTime
+			tw.lastSeqNum = pkt.SequenceNumber
+			tw.lastRTPTimestamp = pkt.Timestamp
+
+			// Write actual packet
+			if err := tw.writer.WriteRTP(pkt); err != nil {
 				fmt.Printf("error writing packet: %v", err)
-				return
 			}
 		})
 
@@ -202,8 +258,8 @@ func (r *Room) StopRecording() error {
 
 	// Close writers
 	for _, m := range session.writers {
-		for _, ow := range m {
-			_ = ow.Close()
+		for _, tw := range m {
+			tw.writer.Close()
 		}
 	}
 	// Write meta.json
