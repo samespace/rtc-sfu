@@ -147,6 +147,7 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 			err = ow.WriteRTP(pkt)
 			if err != nil {
 				fmt.Printf("error writing packet: %v", err)
+				return
 			}
 		})
 
@@ -237,9 +238,9 @@ func (r *Room) StopRecording() error {
 	}
 
 	// Merge channels and upload to S3
-	if err := r.mergeAndUpload(session); err != nil {
-		return err
-	}
+	// if err := r.mergeAndUpload(session); err != nil {
+	// 	return err
+	// }
 
 	r.recordingMu.Lock()
 	r.recordingSession = nil
