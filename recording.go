@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"time"
 
@@ -62,6 +63,7 @@ type trackWriter struct {
 	lastRTPTimestamp uint32
 	lastSeqNum       uint16
 	clockRate        uint32
+	totalSamples     uint64
 }
 
 // StartRecording begins recording audio tracks in the room according to the provided config.
@@ -145,7 +147,7 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 			defer session.mu.Unlock()
 
 			tw := session.writers[clientID][track.ID()]
-			const samplesPerPacket = 960 // 48000Hz * 0.02s (20ms per packet)
+			const samplesPerPacket = 960 // 48000Hz * 0.02s
 
 			if tw.lastRTPTimestamp != 0 {
 				// Calculate missing packets based on RTP timestamp difference
@@ -170,25 +172,26 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 							Payload: []byte{0xFC},
 						}
 
-						if err := tw.writer.WriteRTP(silentPkt); err != nil {
+						// Write with explicit sample count
+						if err := writeRTPWithSamples(tw.writer, silentPkt, samplesPerPacket); err != nil {
 							fmt.Printf("error writing silent packet: %v", err)
 							continue
 						}
 
+						tw.totalSamples += uint64(samplesPerPacket)
 						tw.lastSeqNum++
 						tw.lastRTPTimestamp += samplesPerPacket
 					}
 				}
 			}
 
-			// Update writer state with actual packet values
-			if tw.lastSeqNum == 0 || pkt.SequenceNumber != tw.lastSeqNum+1 {
-				tw.lastSeqNum = pkt.SequenceNumber - 1
-			}
-
-			// Write actual packet
-			if err := tw.writer.WriteRTP(pkt); err != nil {
-				fmt.Printf("error writing packet: %v", err)
+			// Write actual packet with its sample count
+			actualSamples := uint64(pkt.Timestamp - tw.lastRTPTimestamp)
+			if actualSamples > 0 {
+				if err := writeRTPWithSamples(tw.writer, pkt, actualSamples); err != nil {
+					fmt.Printf("error writing packet: %v", err)
+				}
+				tw.totalSamples += actualSamples
 			}
 
 			tw.lastSeqNum = pkt.SequenceNumber
@@ -377,4 +380,16 @@ func (r *Room) mergeAndUpload(session *recordingSession) error {
 	}
 	// Cleanup local files
 	return os.RemoveAll(baseDir)
+}
+
+func writeRTPWithSamples(w *oggwriter.OggWriter, p *rtp.Packet, samples uint64) error {
+	// Use reflection to access private field
+	writer := reflect.ValueOf(w).Elem()
+	granuleField := writer.FieldByName("granule")
+	if granuleField.IsValid() {
+		current := granuleField.Uint()
+		granuleField.SetUint(current + samples)
+	}
+
+	return w.WriteRTP(p)
 }
