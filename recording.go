@@ -165,26 +165,28 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 			session.mu.Lock()
 			defer session.mu.Unlock()
 
-			// Check if this is RED packet (PT 63) and extract primary Opus payload if needed
-			// if pkt.PayloadType == 63 {
-			// 	// For RED packets, extract the primary payload before writing
-			// 	primaryPacket, _, err := ExtractRedPackets(pkt)
-			// 	if err != nil {
-			// 		r.sfu.log.Warnf("recording: error extracting primary payload from RED packet: %v", err)
-			// 		return
-			// 	}
-			// 	_ = ow.WriteRTP(primaryPacket)
-			// } else {
-			// 	// For non-RED packets, write directly
-			// 	_ = ow.WriteRTP(pkt)
-			// }
+			// Process packet - handle RED packets (PT 63) by extracting primary payload
+			var packetToWrite *rtp.Packet = pkt
+			if pkt.PayloadType == 63 {
+				// For RED packets, extract the primary payload before writing
+				primaryPacket, _, err := ExtractRedPackets(pkt)
+				if err != nil {
+					r.sfu.log.Warnf("recording: error extracting primary payload from RED packet: %v", err)
+					return
+				}
+				if primaryPacket == nil {
+					r.sfu.log.Warnf("recording: primary packet extraction returned nil")
+					return
+				}
+				packetToWrite = primaryPacket
+			}
 
 			tw := session.writers[clientID][track.ID()]
 			const samplesPerPacket = 960 // 48000Hz * 0.02s
 
 			if tw.lastRTPTimestamp != 0 {
 				// Calculate missing packets based on RTP timestamp difference
-				diff := pkt.Timestamp - tw.lastRTPTimestamp
+				diff := packetToWrite.Timestamp - tw.lastRTPTimestamp
 				if diff > samplesPerPacket {
 					missingPackets := int((diff / samplesPerPacket) - 1)
 
@@ -197,10 +199,10 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 						silentPkt := &rtp.Packet{
 							Header: rtp.Header{
 								Version:        2,
-								PayloadType:    pkt.PayloadType,
+								PayloadType:    packetToWrite.PayloadType,
 								SequenceNumber: tw.lastSeqNum + 1,
 								Timestamp:      tw.lastRTPTimestamp + samplesPerPacket,
-								SSRC:           pkt.SSRC,
+								SSRC:           packetToWrite.SSRC,
 							},
 							Payload: []byte{0xFC},
 						}
@@ -219,16 +221,16 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 			}
 
 			// Write actual packet with its sample count
-			actualSamples := uint64(pkt.Timestamp - tw.lastRTPTimestamp)
+			actualSamples := uint64(packetToWrite.Timestamp - tw.lastRTPTimestamp)
 			if actualSamples > 0 {
-				if err := writeRTPWithSamples(tw.writer, pkt, actualSamples); err != nil {
+				if err := writeRTPWithSamples(tw.writer, packetToWrite, actualSamples); err != nil {
 					fmt.Printf("error writing packet: %v", err)
 				}
 				tw.totalSamples += actualSamples
 			}
 
-			tw.lastSeqNum = pkt.SequenceNumber
-			tw.lastRTPTimestamp = pkt.Timestamp
+			tw.lastSeqNum = packetToWrite.SequenceNumber
+			tw.lastRTPTimestamp = packetToWrite.Timestamp
 		})
 
 		fmt.Printf("added writer for client %s, track %s", clientID, track.ID())
