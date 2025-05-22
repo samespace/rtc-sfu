@@ -230,19 +230,28 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 	for clientID, client := range r.SFU().clients.GetClients() {
 		fmt.Printf("Client Loop: %s", clientID)
 		for _, track := range client.Tracks() {
-			if track.Kind() == webrtc.RTPCodecTypeAudio {
-				if err := addWriter(clientID, track); err != nil {
-					return id, err
+			go func() {
+				if track.Kind() == webrtc.RTPCodecTypeAudio {
+					if err := addWriter(clientID, track); err != nil {
+						fmt.Printf("error adding writer for client %s, track %s: %v", clientID, track.ID(), err)
+					}
+				}
+			}()
+		}
+
+		// add a hook for add track too
+		client.OnTracksAdded(func(tracks []ITrack) {
+			for _, track := range tracks {
+				if track.Kind() == webrtc.RTPCodecTypeAudio {
+					_ = addWriter(clientID, track)
 				}
 			}
-		}
+		})
 	}
 
 	// Hook future client additions
 	r.OnClientJoined(func(c *Client) {
-
 		fmt.Printf("Client Joined: %s", c.ID())
-
 		for _, track := range c.Tracks() {
 			if track.Kind() == webrtc.RTPCodecTypeAudio {
 				_ = addWriter(c.ID(), track)
