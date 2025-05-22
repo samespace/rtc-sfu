@@ -145,26 +145,29 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 			defer session.mu.Unlock()
 
 			tw := session.writers[clientID][track.ID()]
-			currentTime := time.Now()
-			packetDuration := 20 * time.Millisecond // Opus frame duration
+			const samplesPerPacket = 960 // 48000Hz * 0.02s (20ms per packet)
 
-			if !tw.lastPacketTime.IsZero() {
-				gapDuration := currentTime.Sub(tw.lastPacketTime)
-				if gapDuration > packetDuration {
-					// Calculate number of missing packets
-					missingPackets := int(gapDuration / packetDuration)
+			if tw.lastRTPTimestamp != 0 {
+				// Calculate missing packets based on RTP timestamp difference
+				diff := pkt.Timestamp - tw.lastRTPTimestamp
+				if diff > samplesPerPacket {
+					missingPackets := int((diff / samplesPerPacket) - 1)
 
-					// Generate missing sequence numbers and timestamps
+					// Cap at 1000 packets to prevent runaway (20s max gap)
+					if missingPackets > 1000 {
+						missingPackets = 1000
+					}
+
 					for i := 0; i < missingPackets; i++ {
 						silentPkt := &rtp.Packet{
 							Header: rtp.Header{
 								Version:        2,
 								PayloadType:    pkt.PayloadType,
 								SequenceNumber: tw.lastSeqNum + 1,
-								Timestamp:      tw.lastRTPTimestamp + uint32(packetDuration.Seconds()*float64(tw.clockRate)),
+								Timestamp:      tw.lastRTPTimestamp + samplesPerPacket,
 								SSRC:           pkt.SSRC,
 							},
-							Payload: []byte{0xFC}, // OPUS CNG payload
+							Payload: []byte{0xFC},
 						}
 
 						if err := tw.writer.WriteRTP(silentPkt); err != nil {
@@ -172,21 +175,24 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 							continue
 						}
 
-						tw.lastSeqNum = silentPkt.SequenceNumber
-						tw.lastRTPTimestamp = silentPkt.Timestamp
+						tw.lastSeqNum++
+						tw.lastRTPTimestamp += samplesPerPacket
 					}
 				}
 			}
 
-			// Update track writer state
-			tw.lastPacketTime = currentTime
-			tw.lastSeqNum = pkt.SequenceNumber
-			tw.lastRTPTimestamp = pkt.Timestamp
+			// Update writer state with actual packet values
+			if tw.lastSeqNum == 0 || pkt.SequenceNumber != tw.lastSeqNum+1 {
+				tw.lastSeqNum = pkt.SequenceNumber - 1
+			}
 
 			// Write actual packet
 			if err := tw.writer.WriteRTP(pkt); err != nil {
 				fmt.Printf("error writing packet: %v", err)
 			}
+
+			tw.lastSeqNum = pkt.SequenceNumber
+			tw.lastRTPTimestamp = pkt.Timestamp
 		})
 
 		return nil
