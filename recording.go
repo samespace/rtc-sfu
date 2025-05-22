@@ -45,77 +45,13 @@ type RecordingConfig struct {
 type recordingSession struct {
 	id      string
 	cfg     RecordingConfig
-	writers map[string]map[string]*trackWriter // clientID -> trackID -> writer
+	writers map[string]map[string]*oggwriter.OggWriter // clientID -> trackID -> writer
 	mu      sync.Mutex
 	paused  bool
 	meta    struct {
 		StartTime time.Time
 		StopTime  time.Time
 		Events    []Event
-	}
-}
-
-type trackWriter struct {
-	ow          *oggwriter.OggWriter
-	packetChan  chan *rtp.Packet
-	done        chan struct{}
-	initialTS   uint32
-	firstPacket time.Time
-	lastTS      uint32
-	lastSeq     uint16
-	ssrc        uint32
-	mu          sync.Mutex
-}
-
-func (tw *trackWriter) process() {
-	defer close(tw.done)
-	// defer tw.ow.Close()
-
-	for pkt := range tw.packetChan {
-		tw.mu.Lock()
-		if tw.initialTS == 0 {
-			tw.initialTS = pkt.Timestamp
-			tw.firstPacket = time.Now()
-			tw.ssrc = pkt.SSRC
-			tw.lastTS = pkt.Timestamp
-			tw.lastSeq = pkt.SequenceNumber
-			tw.ow.WriteRTP(pkt)
-			tw.mu.Unlock()
-			continue
-		}
-
-		currentTS := pkt.Timestamp
-		delta := currentTS - tw.lastTS
-		numFrames := delta / 960
-
-		if numFrames > 1 {
-			numSilence := numFrames - 1
-			for i := uint32(0); i < numSilence; i++ {
-				silenceTS := tw.lastTS + 960*(i+1)
-				silenceSeq := tw.lastSeq + uint16(i+1)
-				silencePkt := &rtp.Packet{
-					Header: rtp.Header{
-						Version:        2,
-						PayloadType:    111,
-						Timestamp:      silenceTS,
-						SequenceNumber: silenceSeq,
-						SSRC:           tw.ssrc,
-					},
-					Payload: []byte{0xFC}, // Opus silence payload
-				}
-				if err := tw.ow.WriteRTP(silencePkt); err != nil {
-					fmt.Printf("error writing silence packet: %v", err)
-				}
-			}
-		}
-
-		if err := tw.ow.WriteRTP(pkt); err != nil {
-			fmt.Printf("error writing packet: %v", err)
-		}
-
-		tw.lastTS = currentTS
-		tw.lastSeq = pkt.SequenceNumber
-		tw.mu.Unlock()
 	}
 }
 
@@ -130,7 +66,7 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 	session := &recordingSession{
 		id:      id,
 		cfg:     cfg,
-		writers: make(map[string]map[string]*trackWriter),
+		writers: make(map[string]map[string]*oggwriter.OggWriter),
 	}
 	session.meta.StartTime = time.Now()
 
@@ -168,39 +104,32 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 			return nil
 		}
 		if _, ok := session.writers[clientID]; !ok {
-			session.writers[clientID] = make(map[string]*trackWriter)
+			session.writers[clientID] = make(map[string]*oggwriter.OggWriter)
 		}
 		trackDir := filepath.Join(baseDir, clientID)
 		if err := os.MkdirAll(trackDir, 0755); err != nil {
 			return err
 		}
-
 		filePath := filepath.Join(trackDir, fmt.Sprintf("%s.ogg", track.ID()))
-		ow, err := oggwriter.New(filePath, 48000, 1)
+
+		sampleRate := uint32(48000) // Default for Opus
+		channelCount := uint16(1)   // Default for Opus
+
+		ow, err := oggwriter.New(filePath, sampleRate, channelCount)
 		if err != nil {
 			return err
 		}
-
-		tw := &trackWriter{
-			ow:         ow,
-			packetChan: make(chan *rtp.Packet, 100),
-			done:       make(chan struct{}),
-		}
-
-		// Start processing goroutine
-		go tw.process()
-
-		session.writers[clientID][track.ID()] = tw
-
+		session.writers[clientID][track.ID()] = ow
 		track.OnRead(func(attrs interceptor.Attributes, pkt *rtp.Packet, q QualityLevel) {
+			fmt.Printf("received packet: %v", pkt)
+			// skip when paused
 			if session.paused {
 				return
 			}
-
-			select {
-			case tw.packetChan <- pkt:
-			default:
-				fmt.Println("packet buffer full, dropping packet")
+			// For non-RED packets, write directly
+			err = ow.WriteRTP(pkt)
+			if err != nil {
+				fmt.Printf("error saving packet: %v", err)
 			}
 		})
 		return nil
@@ -270,44 +199,12 @@ func (r *Room) StopRecording() error {
 	session.meta.StopTime = time.Now()
 	session.mu.Unlock()
 
-	// Close writers and process remaining silence
-	for _, trackMap := range session.writers {
-		for _, tw := range trackMap {
-			close(tw.packetChan)
-			<-tw.done // Wait for processing to finish
-
-			// Fill remaining silence up to stop time
-			duration := session.meta.StopTime.Sub(tw.firstPacket).Seconds()
-			expectedSamples := uint32(duration * 48000)
-			generatedSamples := tw.lastTS - tw.initialTS
-
-			if expectedSamples > generatedSamples {
-				remaining := expectedSamples - generatedSamples
-				numFrames := remaining / 960
-				tw.mu.Lock()
-				for i := uint32(0); i < numFrames; i++ {
-					silenceTS := tw.lastTS + 960*(i+1)
-					silenceSeq := tw.lastSeq + uint16(i+1)
-					silencePkt := &rtp.Packet{
-						Header: rtp.Header{
-							Version:        2,
-							PayloadType:    111,
-							Timestamp:      silenceTS,
-							SequenceNumber: silenceSeq,
-							SSRC:           tw.ssrc,
-						},
-						Payload: []byte{0xFC},
-					}
-					if err := tw.ow.WriteRTP(silencePkt); err != nil {
-						fmt.Printf("error writing final silence: %v", err)
-					}
-				}
-				tw.ow.Close()
-				tw.mu.Unlock()
-			}
+	// Close writers
+	for _, m := range session.writers {
+		for _, ow := range m {
+			_ = ow.Close()
 		}
 	}
-
 	// Write meta.json
 	metaFile := filepath.Join(session.cfg.BasePath, session.id, "meta.json")
 	f, err := os.Create(metaFile)
