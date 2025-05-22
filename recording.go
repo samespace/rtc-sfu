@@ -165,6 +165,10 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 			session.mu.Lock()
 			defer session.mu.Unlock()
 
+			if pkt.SequenceNumber == 0 {
+				pkt.Marker = true
+			}
+
 			tw := session.writers[clientID][track.ID()]
 			const samplesPerPacket = 960 // 48000Hz * 0.02s
 
