@@ -180,6 +180,7 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 				}
 				packetToWrite = primaryPacket
 			}
+			packetToWrite.PayloadType = 111
 
 			tw := session.writers[clientID][track.ID()]
 			const samplesPerPacket = 960 // 48000Hz * 0.02s
