@@ -370,14 +370,19 @@ func (r *Room) mergeAndUpload(session *recordingSession) error {
 		Secure: session.cfg.S3.Secure,
 	})
 	if err != nil {
+		fmt.Printf("error creating minio client: %v", err)
 		return err
 	}
 	object := filepath.Join(session.cfg.S3.FilePrefix, session.id+".ogg")
 	ctx := context.Background()
 	_, err = mc.FPutObject(ctx, session.cfg.S3.Bucket, object, finalPath, minio.PutObjectOptions{ContentType: "audio/ogg"})
 	if err != nil {
+		fmt.Printf("error uploading to s3: %v", err)
 		return err
 	}
+
+	fmt.Printf("uploaded to s3: %s", object)
+	fmt.Printf("removing local files: %s", baseDir)
 	// Cleanup local files
 	return os.RemoveAll(baseDir)
 }
