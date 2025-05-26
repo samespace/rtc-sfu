@@ -64,6 +64,7 @@ type trackWriter struct {
 	lastSeqNum       uint16
 	clockRate        uint32
 	totalSamples     uint64
+	ssrc             uint32
 }
 
 // StartRecording begins recording audio tracks in the room according to the provided config.
@@ -157,6 +158,7 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 			lastRTPTimestamp: 0,
 			lastSeqNum:       0,
 		}
+
 		track.OnRead(func(attrs interceptor.Attributes, pkt *rtp.Packet, q QualityLevel) {
 			if session.paused {
 				return
@@ -170,55 +172,74 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 			}
 
 			tw := session.writers[clientID][track.ID()]
-			const samplesPerPacket = 960 // 48000Hz * 0.02s
+			const samplesPerPacket = 960 // 20ms at 48kHz
+			now := time.Now()
 
-			if tw.lastRTPTimestamp != 0 {
-				// Calculate missing packets based on RTP timestamp difference
-				diff := pkt.Timestamp - tw.lastRTPTimestamp
-				if diff > samplesPerPacket {
-					missingPackets := int((diff / samplesPerPacket) - 1)
+			tw.ssrc = pkt.SSRC
 
-					// Cap at 1000 packets to prevent runaway (20s max gap)
-					if missingPackets > 1000 {
-						missingPackets = 1000
-					}
-
-					for i := 0; i < missingPackets; i++ {
-						silentPkt := &rtp.Packet{
-							Header: rtp.Header{
-								Version:        2,
-								PayloadType:    pkt.PayloadType,
-								SequenceNumber: tw.lastSeqNum + 1,
-								Timestamp:      tw.lastRTPTimestamp + samplesPerPacket,
-								SSRC:           pkt.SSRC,
-							},
-							Payload: []byte{0xFC},
-						}
-
-						// Write with explicit sample count
-						if err := writeRTPWithSamples(tw.writer, silentPkt, samplesPerPacket); err != nil {
-							fmt.Printf("error writing silent packet: %v", err)
-							continue
-						}
-
-						tw.totalSamples += uint64(samplesPerPacket)
-						tw.lastSeqNum++
-						tw.lastRTPTimestamp += samplesPerPacket
-					}
+			// Initialize lastPacketTime with first packet arrival or session start
+			if tw.lastPacketTime.IsZero() {
+				tw.lastPacketTime = session.meta.StartTime
+				if pkt.Timestamp != 0 {
+					tw.lastPacketTime = now
 				}
 			}
 
-			// Write actual packet with its sample count
-			actualSamples := uint64(pkt.Timestamp - tw.lastRTPTimestamp)
-			if actualSamples > 0 {
-				if err := writeRTPWithSamples(tw.writer, pkt, actualSamples); err != nil {
-					fmt.Printf("error writing packet: %v", err)
-				}
-				tw.totalSamples += actualSamples
+			// Calculate time-based gap (real-time duration since last packet)
+			timeGap := now.Sub(tw.lastPacketTime)
+			expectedPacketsTime := int(timeGap.Seconds() * float64(tw.clockRate) / float64(samplesPerPacket))
+
+			// Calculate sequence-based gap
+			seqGap := int(pkt.SequenceNumber - tw.lastSeqNum - 1)
+			if seqGap < 0 { // Handle sequence wrap
+				seqGap = int(pkt.SequenceNumber) + (65535 - int(tw.lastSeqNum))
 			}
 
+			// Use the larger of the two gap calculations
+			missingPackets := seqGap
+			if expectedPacketsTime > missingPackets {
+				missingPackets = expectedPacketsTime
+			}
+
+			// Cap missing packets at 60 seconds worth (3000 packets)
+			if missingPackets > 3000 {
+				missingPackets = 3000
+			}
+
+			// Generate silence for gaps
+			if missingPackets > 0 {
+				for i := 0; i < missingPackets; i++ {
+					silentPkt := &rtp.Packet{
+						Header: rtp.Header{
+							Version:        2,
+							PayloadType:    pkt.PayloadType,
+							SequenceNumber: tw.lastSeqNum + 1,
+							Timestamp:      tw.lastRTPTimestamp + samplesPerPacket,
+							SSRC:           pkt.SSRC,
+						},
+						Payload: []byte{0xFC},
+					}
+
+					if err := writeRTPWithSamples(tw.writer, silentPkt, samplesPerPacket); err != nil {
+						fmt.Printf("error writing silent packet: %v", err)
+						continue
+					}
+
+					tw.totalSamples += uint64(samplesPerPacket)
+					tw.lastSeqNum++
+					tw.lastRTPTimestamp += samplesPerPacket
+				}
+			}
+
+			// Write actual packet
+			if err := writeRTPWithSamples(tw.writer, pkt, samplesPerPacket); err != nil {
+				fmt.Printf("error writing packet: %v", err)
+			}
+
+			tw.totalSamples += uint64(samplesPerPacket)
 			tw.lastSeqNum = pkt.SequenceNumber
 			tw.lastRTPTimestamp = pkt.Timestamp
+			tw.lastPacketTime = now
 		})
 
 		fmt.Printf("added writer for client %s, track %s", clientID, track.ID())
@@ -304,11 +325,38 @@ func (r *Room) StopRecording() error {
 	session.mu.Unlock()
 
 	// Close writers
+	// Fill remaining silence for all writers
 	for _, m := range session.writers {
 		for _, tw := range m {
+			duration := session.meta.StopTime.Sub(tw.lastPacketTime)
+			if duration > 0 {
+				samplesNeeded := uint64(duration.Seconds() * float64(tw.clockRate))
+				packetsNeeded := int(samplesNeeded / 960)
+
+				for i := 0; i < packetsNeeded; i++ {
+					silentPkt := &rtp.Packet{
+						Header: rtp.Header{
+							Version:        2,
+							PayloadType:    111,
+							SequenceNumber: tw.lastSeqNum + 1,
+							Timestamp:      tw.lastRTPTimestamp + 960,
+							SSRC:           tw.ssrc,
+						},
+						Payload: []byte{0xFC},
+					}
+
+					if err := writeRTPWithSamples(tw.writer, silentPkt, 960); err != nil {
+						fmt.Printf("error writing final silence: %v", err)
+					}
+
+					tw.lastSeqNum++
+					tw.lastRTPTimestamp += 960
+				}
+			}
 			tw.writer.Close()
 		}
 	}
+
 	// Write meta.json
 	metaFile := filepath.Join(session.cfg.BasePath, session.id, "meta.json")
 	f, err := os.Create(metaFile)
