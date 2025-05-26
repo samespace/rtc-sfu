@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"time"
 
@@ -184,23 +185,24 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 				tw.lastRTPTimestamp = rand.Uint32()
 			}
 
+			// Calculate samples per packet based on clock rate (usually 960 for 20ms at 48kHz)
+			samplesPerPacket := uint32(tw.clockRate * 20 / 1000) // 20ms worth of samples
+
 			// Check for time gap (indicating mute period)
 			timeDiff := currentPacketTime.Sub(timeToCompareWith)
 			if timeDiff > 100*time.Millisecond {
-				// Calculate number of 20ms packets needed to fill the gap
+				// Calculate number of packets needed to fill the gap
 				numPackets := int(timeDiff / (20 * time.Millisecond))
-
-				// Cap at reasonable limit to prevent runaway (max 20 seconds)
-				// if numPackets > 1000 {
-				// 	numPackets = 1000
-				// }
 
 				fmt.Printf("detected gap of %v, inserting %d silence packets", timeDiff, numPackets)
 
 				// Insert silence packets to fill the gap
 				for i := 0; i < numPackets; i++ {
 					tw.lastSeqNum++
-					tw.lastRTPTimestamp += 960 // 20ms at 48kHz = 960 samples
+					tw.lastRTPTimestamp += samplesPerPacket
+
+					// Proper Opus silence frame (DTX - Discontinuous Transmission)
+					opusSilence := []byte{0xF8, 0xFF, 0xFE} // Opus DTX frame
 
 					silentPkt := &rtp.Packet{
 						Header: rtp.Header{
@@ -210,11 +212,11 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 							Timestamp:      tw.lastRTPTimestamp,
 							SSRC:           pkt.SSRC,
 						},
-						Payload: []byte{0xFC}, // Opus silence frame
+						Payload: opusSilence,
 					}
 
 					fmt.Printf("writing silence packet: seq=%d, ts=%d", silentPkt.SequenceNumber, silentPkt.Timestamp)
-					if err := tw.writer.WriteRTP(silentPkt); err != nil {
+					if err := writeRTPWithSamples(tw.writer, silentPkt, uint64(samplesPerPacket)); err != nil {
 						fmt.Printf("error writing silent packet: %v", err)
 						return
 					}
@@ -223,7 +225,7 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 
 			// Process the actual packet
 			tw.lastSeqNum++
-			tw.lastRTPTimestamp += 960
+			tw.lastRTPTimestamp += samplesPerPacket
 
 			// Create a copy to avoid modifying the original packet
 			actualPkt := *pkt
@@ -233,7 +235,7 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 			fmt.Printf("writing actual packet: seq=%d, ts=%d (original: seq=%d, ts=%d)",
 				actualPkt.SequenceNumber, actualPkt.Timestamp, pkt.SequenceNumber, pkt.Timestamp)
 
-			if err := tw.writer.WriteRTP(&actualPkt); err != nil {
+			if err := writeRTPWithSamples(tw.writer, &actualPkt, uint64(samplesPerPacket)); err != nil {
 				fmt.Printf("error writing packet: %v", err)
 				return
 			}
@@ -342,13 +344,19 @@ func (r *Room) StopRecording() error {
 				// Calculate number of 20ms packets needed to fill the gap to session end
 				numPackets := int(timeDiff / (20 * time.Millisecond))
 
+				// Calculate samples per packet based on clock rate
+				samplesPerPacket := uint32(tw.clockRate * 20 / 1000) // 20ms worth of samples
+
 				fmt.Printf("client %s track %s: filling gap to session end, duration: %v, packets: %d",
 					clientID, trackID, timeDiff, numPackets)
 
 				// Insert silence packets to fill the gap to session end
 				for i := 0; i < numPackets; i++ {
 					tw.lastSeqNum++
-					tw.lastRTPTimestamp += 960 // 20ms at 48kHz = 960 samples
+					tw.lastRTPTimestamp += samplesPerPacket
+
+					// Proper Opus silence frame (DTX - Discontinuous Transmission)
+					opusSilence := []byte{0xF8, 0xFF, 0xFE} // Opus DTX frame
 
 					silentPkt := &rtp.Packet{
 						Header: rtp.Header{
@@ -358,10 +366,10 @@ func (r *Room) StopRecording() error {
 							Timestamp:      tw.lastRTPTimestamp,
 							SSRC:           0, // Use 0 since we don't have original SSRC
 						},
-						Payload: []byte{0xFC}, // Opus silence frame
+						Payload: opusSilence,
 					}
 
-					if err := tw.writer.WriteRTP(silentPkt); err != nil {
+					if err := writeRTPWithSamples(tw.writer, silentPkt, uint64(samplesPerPacket)); err != nil {
 						fmt.Printf("error writing final silent packet for client %s track %s: %v", clientID, trackID, err)
 						// Continue processing other tracks even if one fails
 						break
@@ -497,4 +505,16 @@ func (r *Room) mergeAndUpload(session *recordingSession) error {
 	// Cleanup local files
 	os.RemoveAll(baseDir)
 	return nil
+}
+
+func writeRTPWithSamples(w *oggwriter.OggWriter, p *rtp.Packet, samples uint64) error {
+	// Use reflection to access private field
+	writer := reflect.ValueOf(w).Elem()
+	granuleField := writer.FieldByName("granule")
+	if granuleField.IsValid() {
+		current := granuleField.Uint()
+		granuleField.SetUint(current + samples)
+	}
+
+	return w.WriteRTP(p)
 }
