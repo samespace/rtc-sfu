@@ -45,12 +45,13 @@ type RecordingConfig struct {
 }
 
 type recordingSession struct {
-	id      string
-	cfg     RecordingConfig
-	writers map[string]map[string]*trackWriter // clientID -> trackID -> writer
-	mu      sync.Mutex
-	paused  bool
-	meta    struct {
+	id        string
+	cfg       RecordingConfig
+	writers   map[string]map[string]*trackWriter // clientID -> trackID -> writer
+	mu        sync.Mutex
+	paused    bool
+	startTime time.Time // Add explicit start time tracking
+	meta      struct {
 		StartTime time.Time
 		StopTime  time.Time
 		Events    []Event
@@ -64,6 +65,15 @@ type trackWriter struct {
 	lastSeqNum       uint16
 	clockRate        uint32
 	totalSamples     uint64
+
+	// New fields for proper mute handling
+	ourRTPTimestamp    uint32    // Our own RTP timestamp counter
+	ourSeqNum          uint16    // Our own sequence number counter
+	firstPacketTime    time.Time // Wall-clock time of first packet
+	isFirstPacket      bool      // Whether we're waiting for the first packet
+	recordingStartTime time.Time // When recording actually started
+	lastPayloadType    uint8     // Last known payload type
+	lastSSRC           uint32    // Last known SSRC
 }
 
 // StartRecording begins recording audio tracks in the room according to the provided config.
@@ -75,11 +85,12 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 	}
 	id := uuid.New().String()
 	session := &recordingSession{
-		id:      id,
-		cfg:     cfg,
-		writers: make(map[string]map[string]*trackWriter),
+		id:        id,
+		cfg:       cfg,
+		writers:   make(map[string]map[string]*trackWriter),
+		startTime: time.Now(), // Initialize recording start time
 	}
-	session.meta.StartTime = time.Now()
+	session.meta.StartTime = session.startTime
 
 	baseDir := filepath.Join(cfg.BasePath, id)
 	if err := os.MkdirAll(baseDir, 0755); err != nil {
@@ -151,11 +162,17 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 		}
 		// Create trackWriter with proper clock rate
 		session.writers[clientID][track.ID()] = &trackWriter{
-			writer:           ow,
-			clockRate:        sampleRate, // 48000 for Opus
-			lastPacketTime:   time.Time{},
-			lastRTPTimestamp: 0,
-			lastSeqNum:       0,
+			writer:             ow,
+			clockRate:          sampleRate, // 48000 for Opus
+			lastPacketTime:     time.Time{},
+			lastRTPTimestamp:   0,
+			lastSeqNum:         0,
+			ourRTPTimestamp:    0,
+			ourSeqNum:          0,
+			isFirstPacket:      true,
+			recordingStartTime: session.startTime,
+			lastPayloadType:    0,
+			lastSSRC:           0,
 		}
 		track.OnRead(func(attrs interceptor.Attributes, pkt *rtp.Packet, q QualityLevel) {
 			if session.paused {
@@ -165,65 +182,120 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 			session.mu.Lock()
 			defer session.mu.Unlock()
 
-			if pkt.SequenceNumber == 0 {
-				pkt.Marker = true
+			tw := session.writers[clientID][track.ID()]
+			if tw == nil {
+				return
 			}
 
-			tw := session.writers[clientID][track.ID()]
-			const samplesPerPacket = 960 // 48000Hz * 0.02s
+			const samplesPerPacket = 960 // 48000Hz * 0.02s (20ms packets)
+			currentTime := time.Now()
 
-			if tw.lastRTPTimestamp != 0 {
-				// Calculate missing packets based on RTP timestamp difference
-				diff := pkt.Timestamp - tw.lastRTPTimestamp
-				if diff > samplesPerPacket {
-					missingPackets := int((diff / samplesPerPacket) - 1)
+			// Handle first packet
+			if tw.isFirstPacket {
+				tw.isFirstPacket = false
+				tw.firstPacketTime = currentTime
+				tw.lastPacketTime = currentTime
+				tw.lastRTPTimestamp = pkt.Timestamp
+				tw.lastSeqNum = pkt.SequenceNumber
+				tw.ourRTPTimestamp = pkt.Timestamp
+				tw.ourSeqNum = pkt.SequenceNumber
+				tw.lastPayloadType = pkt.PayloadType
+				tw.lastSSRC = pkt.SSRC
 
-					// Cap at 1000 packets to prevent runaway (20s max gap)
-					if missingPackets > 1000 {
-						missingPackets = 1000
-					}
+				// Calculate silence needed from recording start to first packet
+				timeSinceRecordingStart := currentTime.Sub(tw.recordingStartTime)
+				if timeSinceRecordingStart > 100*time.Millisecond { // Only add silence if gap > 100ms
+					silenceDurationMs := int64(timeSinceRecordingStart / time.Millisecond)
+					silencePackets := silenceDurationMs / 20 // 20ms per packet
 
-					for i := 0; i < missingPackets; i++ {
-						silentPkt := &rtp.Packet{
-							Header: rtp.Header{
-								Version:        2,
-								PayloadType:    pkt.PayloadType,
-								SequenceNumber: tw.lastSeqNum + 1,
-								Timestamp:      tw.lastRTPTimestamp + samplesPerPacket,
-								SSRC:           pkt.SSRC,
-							},
-							Payload: []byte{0xFC},
-						}
+					fmt.Printf("Adding %d silence packets (%dms) before first packet for client %s\n",
+						silencePackets, silenceDurationMs, clientID)
 
-						// Write with explicit sample count
+					for i := int64(0); i < silencePackets; i++ {
+						silentPkt := createSilencePacket(
+							pkt.PayloadType,
+							tw.ourSeqNum,
+							tw.ourRTPTimestamp,
+							pkt.SSRC,
+							false, // Don't mark packets in the middle of stream
+						)
+
 						if err := writeRTPWithSamples(tw.writer, silentPkt, samplesPerPacket); err != nil {
-							fmt.Printf("error writing silent packet: %v", err)
+							fmt.Printf("error writing initial silence packet: %v\n", err)
 							continue
 						}
 
 						tw.totalSamples += uint64(samplesPerPacket)
-						tw.lastSeqNum++
-						tw.lastRTPTimestamp += samplesPerPacket
+						tw.ourSeqNum++
+						tw.ourRTPTimestamp += samplesPerPacket
+					}
+				}
+
+				// Mark the actual first packet
+				pkt.Marker = true
+			} else {
+				// Handle subsequent packets - detect mute periods
+				timeSinceLastPacket := currentTime.Sub(tw.lastPacketTime)
+
+				// If more than 40ms has passed since last packet, we likely have a mute period
+				if timeSinceLastPacket > 40*time.Millisecond {
+					silenceDurationMs := int64(timeSinceLastPacket / time.Millisecond)
+					silencePackets := silenceDurationMs / 20 // 20ms per packet
+
+					// Cap silence to prevent runaway (max 20 seconds)
+					if silencePackets > 1000 {
+						silencePackets = 1000
+					}
+
+					fmt.Printf("Detected mute period: %dms (%d packets) for client %s\n",
+						silenceDurationMs, silencePackets, clientID)
+
+					for i := int64(0); i < silencePackets; i++ {
+						silentPkt := createSilencePacket(
+							pkt.PayloadType,
+							tw.ourSeqNum,
+							tw.ourRTPTimestamp,
+							pkt.SSRC,
+							false, // Don't mark packets in the middle of stream
+						)
+
+						if err := writeRTPWithSamples(tw.writer, silentPkt, samplesPerPacket); err != nil {
+							fmt.Printf("error writing mute silence packet: %v\n", err)
+							continue
+						}
+
+						tw.totalSamples += uint64(samplesPerPacket)
+						tw.ourSeqNum++
+						tw.ourRTPTimestamp += samplesPerPacket
 					}
 				}
 			}
 
-			fmt.Println("Client Packet (Client ID): ", clientID, " (Track ID): ", track.ID())
-			fmt.Println("Packet Timestamp: ", pkt.Timestamp)
-			fmt.Println("Packet Sequence Number: ", pkt.SequenceNumber)
-			fmt.Println("--------------------------------")
+			fmt.Printf("Client Packet (Client ID): %s (Track ID): %s\n", clientID, track.ID())
+			fmt.Printf("Packet Timestamp: %d, Our Timestamp: %d\n", pkt.Timestamp, tw.ourRTPTimestamp)
+			fmt.Printf("Packet Sequence Number: %d, Our Seq: %d\n", pkt.SequenceNumber, tw.ourSeqNum)
+			fmt.Printf("Time since last packet: %v\n", currentTime.Sub(tw.lastPacketTime))
+			fmt.Printf("--------------------------------\n")
 
-			// Write actual packet with its sample count
-			actualSamples := uint64(pkt.Timestamp - tw.lastRTPTimestamp)
-			if actualSamples > 0 {
-				if err := writeRTPWithSamples(tw.writer, pkt, actualSamples); err != nil {
-					fmt.Printf("error writing packet: %v", err)
-				}
-				tw.totalSamples += actualSamples
+			// Update packet to use our sequence number and timestamp
+			pkt.SequenceNumber = tw.ourSeqNum
+			pkt.Timestamp = tw.ourRTPTimestamp
+
+			// Write the actual packet
+			if err := writeRTPWithSamples(tw.writer, pkt, samplesPerPacket); err != nil {
+				fmt.Printf("error writing actual packet: %v\n", err)
+			} else {
+				tw.totalSamples += uint64(samplesPerPacket)
 			}
 
-			tw.lastSeqNum = pkt.SequenceNumber
+			// Update our tracking
+			tw.lastPacketTime = currentTime
 			tw.lastRTPTimestamp = pkt.Timestamp
+			tw.lastSeqNum = pkt.SequenceNumber
+			tw.lastPayloadType = pkt.PayloadType
+			tw.lastSSRC = pkt.SSRC
+			tw.ourSeqNum++
+			tw.ourRTPTimestamp += samplesPerPacket
 		})
 
 		fmt.Printf("added writer for client %s, track %s", clientID, track.ID())
@@ -306,6 +378,97 @@ func (r *Room) StopRecording() error {
 	}
 	session.mu.Lock()
 	session.meta.StopTime = time.Now()
+
+	// Add final silence for tracks that were muted when recording stopped
+	const samplesPerPacket = 960 // 48000Hz * 0.02s (20ms packets)
+	stopTime := session.meta.StopTime
+
+	for clientID, writerMap := range session.writers {
+		for trackID, tw := range writerMap {
+			if tw == nil {
+				continue
+			}
+
+			// Handle tracks that were completely muted (never received any packets)
+			if tw.isFirstPacket {
+				// This track never received any packets, fill entire recording duration
+				totalRecordingDuration := stopTime.Sub(tw.recordingStartTime)
+				silenceDurationMs := int64(totalRecordingDuration / time.Millisecond)
+				silencePackets := silenceDurationMs / 20 // 20ms per packet
+
+				// Cap silence to prevent runaway (max 20 seconds)
+				if silencePackets > 1000 {
+					silencePackets = 1000
+				}
+
+				fmt.Printf("Track was completely muted - adding %d silence packets (%dms) for client %s, track %s\n",
+					silencePackets, silenceDurationMs, clientID, trackID)
+
+				for i := int64(0); i < silencePackets; i++ {
+					silentPkt := createSilencePacket(
+						111, // Default Opus payload type
+						tw.ourSeqNum,
+						tw.ourRTPTimestamp,
+						1,      // Default SSRC
+						i == 0, // Mark first packet
+					)
+
+					if err := writeRTPWithSamples(tw.writer, silentPkt, samplesPerPacket); err != nil {
+						fmt.Printf("error writing complete silence packet: %v\n", err)
+						continue
+					}
+
+					tw.totalSamples += uint64(samplesPerPacket)
+					tw.ourSeqNum++
+					tw.ourRTPTimestamp += samplesPerPacket
+				}
+				continue
+			}
+
+			// Calculate silence needed from last packet to recording stop
+			timeSinceLastPacket := stopTime.Sub(tw.lastPacketTime)
+			if timeSinceLastPacket > 40*time.Millisecond { // Only add if gap > 40ms
+				silenceDurationMs := int64(timeSinceLastPacket / time.Millisecond)
+				silencePackets := silenceDurationMs / 20 // 20ms per packet
+
+				// Cap silence to prevent runaway (max 20 seconds)
+				if silencePackets > 1000 {
+					silencePackets = 1000
+				}
+
+				// Use default values if track never received packets
+				payloadType := tw.lastPayloadType
+				ssrc := tw.lastSSRC
+				if payloadType == 0 {
+					payloadType = 111 // Default Opus payload type
+					ssrc = 1          // Default SSRC
+				}
+
+				fmt.Printf("Adding %d final silence packets (%dms) for client %s, track %s\n",
+					silencePackets, silenceDurationMs, clientID, trackID)
+
+				for i := int64(0); i < silencePackets; i++ {
+					silentPkt := createSilencePacket(
+						payloadType, // Use stored or default payload type
+						tw.ourSeqNum,
+						tw.ourRTPTimestamp,
+						ssrc,  // Use stored or default SSRC
+						false, // Don't mark packets at end of stream
+					)
+
+					if err := writeRTPWithSamples(tw.writer, silentPkt, samplesPerPacket); err != nil {
+						fmt.Printf("error writing final silence packet: %v\n", err)
+						continue
+					}
+
+					tw.totalSamples += uint64(samplesPerPacket)
+					tw.ourSeqNum++
+					tw.ourRTPTimestamp += samplesPerPacket
+				}
+			}
+		}
+	}
+
 	session.mu.Unlock()
 
 	// Close writers
@@ -441,4 +604,19 @@ func writeRTPWithSamples(w *oggwriter.OggWriter, p *rtp.Packet, samples uint64) 
 	}
 
 	return w.WriteRTP(p)
+}
+
+// createSilencePacket creates an RTP packet containing silence for the given parameters
+func createSilencePacket(payloadType uint8, seqNum uint16, timestamp uint32, ssrc uint32, marker bool) *rtp.Packet {
+	return &rtp.Packet{
+		Header: rtp.Header{
+			Version:        2,
+			PayloadType:    payloadType,
+			SequenceNumber: seqNum,
+			Timestamp:      timestamp,
+			SSRC:           ssrc,
+			Marker:         marker,
+		},
+		Payload: []byte{0xFC}, // Opus silence frame
+	}
 }
