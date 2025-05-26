@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -64,7 +65,6 @@ type trackWriter struct {
 	lastRTPTimestamp uint32
 	lastSeqNum       uint16
 	clockRate        uint32
-	totalSamples     uint64
 	mu               sync.Mutex
 }
 
@@ -160,6 +160,8 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 			lastSeqNum:       0,
 			mu:               sync.Mutex{},
 		}
+		const samplesPerPacket = 960 // 48000Hz * 0.02s
+
 		track.OnRead(func(attrs interceptor.Attributes, pkt *rtp.Packet, q QualityLevel) {
 			if session.paused || session.stopped {
 				return
@@ -169,7 +171,60 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 			tw.mu.Lock()
 			defer tw.mu.Unlock()
 
-			const samplesPerPacket = 960 // 48000Hz * 0.02s
+			// the time packet arrived
+			currentPacketTime := time.Now()
+
+			// what time should we compare with? to insert the silence packet
+			timeToCompareWith := tw.lastPacketTime
+			if timeToCompareWith.IsZero() {
+				timeToCompareWith = session.meta.StartTime
+			}
+
+			// if this is the first packet initialise lastSeqNum and lastRTPTimestamp
+			if tw.lastSeqNum == 0 {
+				tw.lastSeqNum = uint16(rand.IntN(1 << 16))
+				tw.lastRTPTimestamp = rand.Uint32()
+			}
+
+			if timeToCompareWith.Sub(currentPacketTime) > 100*time.Millisecond {
+				// now let's add silence packet
+				// find the number of 20ms packets to add
+				numPackets := timeToCompareWith.Sub(currentPacketTime) / 20 * time.Millisecond
+				for i := 0; i < int(numPackets); i++ {
+					tw.lastSeqNum++
+					tw.lastRTPTimestamp += 960
+
+					silentPkt := &rtp.Packet{
+						Header: rtp.Header{
+							Version:        2,
+							PayloadType:    111,
+							SequenceNumber: tw.lastSeqNum,
+							Timestamp:      tw.lastRTPTimestamp,
+							SSRC:           pkt.SSRC,
+						},
+						Payload: []byte{0xFC},
+					}
+
+					err := tw.writer.WriteRTP(silentPkt)
+					if err != nil {
+						fmt.Printf("error writing silent packet: %v", err)
+						return
+					}
+				}
+			}
+
+			tw.lastSeqNum++
+			tw.lastRTPTimestamp += 960
+
+			// now just add the actual packet
+			pkt.SequenceNumber = tw.lastSeqNum
+			pkt.Timestamp = tw.lastRTPTimestamp
+
+			err := tw.writer.WriteRTP(pkt)
+			if err != nil {
+				fmt.Printf("error writing packet: %v", err)
+				return
+			}
 
 			// if tw.lastRTPTimestamp != 0 {
 			// 	// Calculate missing packets based on RTP timestamp difference
@@ -219,11 +274,6 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 			// tw.lastSeqNum = pkt.SequenceNumber
 			// tw.lastRTPTimestamp = pkt.Timestamp
 
-			err := tw.writer.WriteRTP(pkt)
-			if err != nil {
-				fmt.Printf("error writing packet: %v", err)
-				return
-			}
 		})
 
 		fmt.Printf("added writer for client %s, track %s", clientID, track.ID())
