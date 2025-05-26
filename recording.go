@@ -193,14 +193,14 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 				// Calculate number of packets needed to fill the gap
 				numPackets := int(timeDiff / (20 * time.Millisecond))
 
-				fmt.Printf("detected gap of %v, inserting %d silence packets", timeDiff, numPackets)
-
 				// Insert silence packets to fill the gap
 				for i := 0; i < numPackets; i++ {
 					tw.lastSeqNum++
 					tw.lastRTPTimestamp += samplesPerPacket
 
-					// Proper Opus silence frame - empty payload tells Opus decoder to generate silence
+					// Proper Opus silence frame (DTX - Discontinuous Transmission)
+					opusSilence := []byte{0xF8, 0xFF, 0xFE} // Opus DTX frame
+
 					silentPkt := &rtp.Packet{
 						Header: rtp.Header{
 							Version:        2,
@@ -209,10 +209,9 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 							Timestamp:      tw.lastRTPTimestamp,
 							SSRC:           pkt.SSRC,
 						},
-						Payload: []byte{}, // Empty payload = silence for Opus
+						Payload: opusSilence,
 					}
 
-					fmt.Printf("writing silence packet: seq=%d, ts=%d", silentPkt.SequenceNumber, silentPkt.Timestamp)
 					if err := tw.writer.WriteRTP(silentPkt); err != nil {
 						fmt.Printf("error writing silent packet: %v", err)
 						return
@@ -228,9 +227,6 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 			actualPkt := *pkt
 			actualPkt.SequenceNumber = tw.lastSeqNum
 			actualPkt.Timestamp = tw.lastRTPTimestamp
-
-			fmt.Printf("writing actual packet: seq=%d, ts=%d (original: seq=%d, ts=%d)",
-				actualPkt.SequenceNumber, actualPkt.Timestamp, pkt.SequenceNumber, pkt.Timestamp)
 
 			if err := tw.writer.WriteRTP(&actualPkt); err != nil {
 				fmt.Printf("error writing packet: %v", err)
@@ -344,15 +340,14 @@ func (r *Room) StopRecording() error {
 				// Calculate samples per packet based on clock rate
 				samplesPerPacket := uint32(tw.clockRate * 20 / 1000) // 20ms worth of samples
 
-				fmt.Printf("client %s track %s: filling gap to session end, duration: %v, packets: %d",
-					clientID, trackID, timeDiff, numPackets)
-
 				// Insert silence packets to fill the gap to session end
 				for i := 0; i < numPackets; i++ {
 					tw.lastSeqNum++
 					tw.lastRTPTimestamp += samplesPerPacket
 
-					// Proper Opus silence frame - empty payload tells Opus decoder to generate silence
+					// Proper Opus silence frame (DTX - Discontinuous Transmission)
+					opusSilence := []byte{0xF8, 0xFF, 0xFE} // Opus DTX frame
+
 					silentPkt := &rtp.Packet{
 						Header: rtp.Header{
 							Version:        2,
@@ -361,7 +356,7 @@ func (r *Room) StopRecording() error {
 							Timestamp:      tw.lastRTPTimestamp,
 							SSRC:           0, // Use 0 since we don't have original SSRC
 						},
-						Payload: []byte{}, // Empty payload = silence for Opus
+						Payload: opusSilence,
 					}
 
 					if err := tw.writer.WriteRTP(silentPkt); err != nil {
