@@ -50,6 +50,7 @@ type recordingSession struct {
 	writers map[string]map[string]*trackWriter // clientID -> trackID -> writer
 	mu      sync.Mutex
 	paused  bool
+	stopped bool
 	meta    struct {
 		StartTime time.Time
 		StopTime  time.Time
@@ -158,7 +159,7 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 			lastSeqNum:       0,
 		}
 		track.OnRead(func(attrs interceptor.Attributes, pkt *rtp.Packet, q QualityLevel) {
-			if session.paused {
+			if session.paused || session.stopped {
 				return
 			}
 
@@ -213,6 +214,7 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 			if actualSamples > 0 {
 				if err := writeRTPWithSamples(tw.writer, pkt, actualSamples); err != nil {
 					fmt.Printf("error writing packet: %v", err)
+					return
 				}
 				tw.totalSamples += actualSamples
 			}
@@ -301,6 +303,7 @@ func (r *Room) StopRecording() error {
 	}
 	session.mu.Lock()
 	session.meta.StopTime = time.Now()
+	session.stopped = true
 	session.mu.Unlock()
 
 	// Close writers
