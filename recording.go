@@ -208,6 +208,11 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 				}
 			}
 
+			fmt.Println("Client Packet (Client ID): ", clientID, " (Track ID): ", track.ID())
+			fmt.Println("Packet Timestamp: ", pkt.Timestamp)
+			fmt.Println("Packet Sequence Number: ", pkt.SequenceNumber)
+			fmt.Println("--------------------------------")
+
 			// Write actual packet with its sample count
 			actualSamples := uint64(pkt.Timestamp - tw.lastRTPTimestamp)
 			if actualSamples > 0 {
