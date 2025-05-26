@@ -200,9 +200,7 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 					tw.lastSeqNum++
 					tw.lastRTPTimestamp += samplesPerPacket
 
-					// Proper Opus silence frame (DTX - Discontinuous Transmission)
-					opusSilence := []byte{0xF8, 0xFF, 0xFE} // Opus DTX frame
-
+					// Proper Opus silence frame - empty payload tells Opus decoder to generate silence
 					silentPkt := &rtp.Packet{
 						Header: rtp.Header{
 							Version:        2,
@@ -211,7 +209,7 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 							Timestamp:      tw.lastRTPTimestamp,
 							SSRC:           pkt.SSRC,
 						},
-						Payload: opusSilence,
+						Payload: []byte{}, // Empty payload = silence for Opus
 					}
 
 					fmt.Printf("writing silence packet: seq=%d, ts=%d", silentPkt.SequenceNumber, silentPkt.Timestamp)
@@ -354,9 +352,7 @@ func (r *Room) StopRecording() error {
 					tw.lastSeqNum++
 					tw.lastRTPTimestamp += samplesPerPacket
 
-					// Proper Opus silence frame (DTX - Discontinuous Transmission)
-					opusSilence := []byte{0xF8, 0xFF, 0xFE} // Opus DTX frame
-
+					// Proper Opus silence frame - empty payload tells Opus decoder to generate silence
 					silentPkt := &rtp.Packet{
 						Header: rtp.Header{
 							Version:        2,
@@ -365,7 +361,7 @@ func (r *Room) StopRecording() error {
 							Timestamp:      tw.lastRTPTimestamp,
 							SSRC:           0, // Use 0 since we don't have original SSRC
 						},
-						Payload: opusSilence,
+						Payload: []byte{}, // Empty payload = silence for Opus
 					}
 
 					if err := tw.writer.WriteRTP(silentPkt); err != nil {
