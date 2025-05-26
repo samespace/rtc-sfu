@@ -65,6 +65,8 @@ type trackWriter struct {
 	lastSeqNum       uint16
 	clockRate        uint32
 	totalSamples     uint64
+	lastPayloadType  uint8
+	lastSSRC         uint32
 }
 
 // StartRecording begins recording audio tracks in the room according to the provided config.
@@ -221,6 +223,9 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 
 			tw.lastSeqNum = pkt.SequenceNumber
 			tw.lastRTPTimestamp = pkt.Timestamp
+			tw.lastPayloadType = pkt.PayloadType
+			tw.lastSSRC = pkt.SSRC
+			tw.lastPacketTime = time.Now()
 		})
 
 		fmt.Printf("added writer for client %s, track %s", clientID, track.ID())
@@ -305,6 +310,53 @@ func (r *Room) StopRecording() error {
 	session.meta.StopTime = time.Now()
 	session.stopped = true
 	session.mu.Unlock()
+
+	// Add final silence to fill gap between last packet and stop time
+	for _, tracks := range session.writers {
+		for _, tw := range tracks {
+			if tw.lastPacketTime.IsZero() {
+				continue
+			}
+
+			duration := session.meta.StopTime.Sub(tw.lastPacketTime)
+			if duration <= 0 {
+				continue
+			}
+
+			samplesNeeded := uint64(float64(tw.clockRate) * duration.Seconds())
+			if samplesNeeded == 0 {
+				continue
+			}
+
+			samplesPerPacket := uint32(960)
+			packetsNeeded := (samplesNeeded + uint64(samplesPerPacket) - 1) / uint64(samplesPerPacket)
+			if packetsNeeded > 1000 {
+				packetsNeeded = 1000
+			}
+
+			for i := uint64(0); i < packetsNeeded; i++ {
+				silentPkt := &rtp.Packet{
+					Header: rtp.Header{
+						Version:        2,
+						PayloadType:    tw.lastPayloadType,
+						SequenceNumber: tw.lastSeqNum + 1 + uint16(i),
+						Timestamp:      tw.lastRTPTimestamp + samplesPerPacket*(uint32(i)+1),
+						SSRC:           tw.lastSSRC,
+					},
+					Payload: []byte{0xFC},
+				}
+
+				if err := writeRTPWithSamples(tw.writer, silentPkt, uint64(samplesPerPacket)); err != nil {
+					fmt.Printf("error writing final silence packet: %v", err)
+					continue
+				}
+
+				tw.lastSeqNum = silentPkt.SequenceNumber
+				tw.lastRTPTimestamp = silentPkt.Timestamp
+				tw.totalSamples += uint64(samplesPerPacket)
+			}
+		}
+	}
 
 	// Close writers
 	for _, m := range session.writers {
