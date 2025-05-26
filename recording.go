@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"sync"
 	"time"
 
@@ -216,7 +215,7 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 					}
 
 					fmt.Printf("writing silence packet: seq=%d, ts=%d", silentPkt.SequenceNumber, silentPkt.Timestamp)
-					if err := writeRTPWithSamples(tw.writer, silentPkt, uint64(samplesPerPacket)); err != nil {
+					if err := tw.writer.WriteRTP(silentPkt); err != nil {
 						fmt.Printf("error writing silent packet: %v", err)
 						return
 					}
@@ -235,7 +234,7 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 			fmt.Printf("writing actual packet: seq=%d, ts=%d (original: seq=%d, ts=%d)",
 				actualPkt.SequenceNumber, actualPkt.Timestamp, pkt.SequenceNumber, pkt.Timestamp)
 
-			if err := writeRTPWithSamples(tw.writer, &actualPkt, uint64(samplesPerPacket)); err != nil {
+			if err := tw.writer.WriteRTP(&actualPkt); err != nil {
 				fmt.Printf("error writing packet: %v", err)
 				return
 			}
@@ -369,7 +368,7 @@ func (r *Room) StopRecording() error {
 						Payload: opusSilence,
 					}
 
-					if err := writeRTPWithSamples(tw.writer, silentPkt, uint64(samplesPerPacket)); err != nil {
+					if err := tw.writer.WriteRTP(silentPkt); err != nil {
 						fmt.Printf("error writing final silent packet for client %s track %s: %v", clientID, trackID, err)
 						// Continue processing other tracks even if one fails
 						break
@@ -502,19 +501,6 @@ func (r *Room) mergeAndUpload(session *recordingSession) error {
 
 	fmt.Printf("uploaded to s3: %s", object)
 	fmt.Printf("removing local files: %s", baseDir)
-	// Cleanup local files
 	os.RemoveAll(baseDir)
 	return nil
-}
-
-func writeRTPWithSamples(w *oggwriter.OggWriter, p *rtp.Packet, samples uint64) error {
-	// Use reflection to access private field
-	writer := reflect.ValueOf(w).Elem()
-	granuleField := writer.FieldByName("granule")
-	if granuleField.IsValid() {
-		current := granuleField.Uint()
-		granuleField.SetUint(current + samples)
-	}
-
-	return w.WriteRTP(p)
 }
