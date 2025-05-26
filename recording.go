@@ -322,6 +322,56 @@ func (r *Room) StopRecording() error {
 	}
 	session.mu.Lock()
 	session.meta.StopTime = time.Now()
+	session.stopped = true
+	session.mu.Unlock()
+
+	// Fill any gaps from client disconnections during mute to session end
+	session.mu.Lock()
+	for clientID, writerMap := range session.writers {
+		for trackID, tw := range writerMap {
+			tw.mu.Lock()
+
+			// Check if there's a gap between last packet and session end
+			timeToCompareWith := tw.lastPacketTime
+			if timeToCompareWith.IsZero() {
+				timeToCompareWith = session.meta.StartTime
+			}
+
+			timeDiff := session.meta.StopTime.Sub(timeToCompareWith)
+			if timeDiff > 100*time.Millisecond {
+				// Calculate number of 20ms packets needed to fill the gap to session end
+				numPackets := int(timeDiff / (20 * time.Millisecond))
+
+				fmt.Printf("client %s track %s: filling gap to session end, duration: %v, packets: %d",
+					clientID, trackID, timeDiff, numPackets)
+
+				// Insert silence packets to fill the gap to session end
+				for i := 0; i < numPackets; i++ {
+					tw.lastSeqNum++
+					tw.lastRTPTimestamp += 960 // 20ms at 48kHz = 960 samples
+
+					silentPkt := &rtp.Packet{
+						Header: rtp.Header{
+							Version:        2,
+							PayloadType:    111, // Opus payload type
+							SequenceNumber: tw.lastSeqNum,
+							Timestamp:      tw.lastRTPTimestamp,
+							SSRC:           0, // Use 0 since we don't have original SSRC
+						},
+						Payload: []byte{0xFC}, // Opus silence frame
+					}
+
+					if err := tw.writer.WriteRTP(silentPkt); err != nil {
+						fmt.Printf("error writing final silent packet for client %s track %s: %v", clientID, trackID, err)
+						// Continue processing other tracks even if one fails
+						break
+					}
+				}
+			}
+
+			tw.mu.Unlock()
+		}
+	}
 	session.mu.Unlock()
 
 	// Close writers
