@@ -260,7 +260,7 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 		}
 
 		// add a hook for add track too
-		client.OnTracksAvailable(func(tracks []ITrack) {
+		client.OnTracksReady(func(tracks []ITrack) {
 			for _, track := range tracks {
 				if track.Kind() == webrtc.RTPCodecTypeAudio {
 					_ = addWriter(clientID, track)
