@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"time"
 
@@ -219,7 +220,7 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 							Payload: opusSilence,
 						}
 
-						if err := tw.writer.WriteRTP(silentPkt); err != nil {
+						if err := writeRTPWithSamples(tw.writer, silentPkt, uint64(samplesPerPacket)); err != nil {
 							fmt.Printf("error writing silent packet: %v", err)
 							return
 						}
@@ -234,8 +235,8 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 				pkt.SequenceNumber = tw.lastSeqNum
 				pkt.Timestamp = tw.lastRTPTimestamp
 
-				if err := tw.writer.WriteRTP(pkt); err != nil {
-					fmt.Printf("error writing packet: %v", err)
+				if err := writeRTPWithSamples(tw.writer, pkt, uint64(samplesPerPacket)); err != nil {
+					fmt.Printf("error writing audio packet: %v", err)
 					return
 				}
 
@@ -320,8 +321,8 @@ func (r *Room) StopRecording() error {
 
 	// Fill any gaps from client disconnections during mute to session end
 	session.mu.Lock()
-	for clientID, writerMap := range session.writers {
-		for trackID, tw := range writerMap {
+	for _, writerMap := range session.writers {
+		for _, tw := range writerMap {
 			tw.mu.Lock()
 
 			// Check if there's a gap between last packet and session end
@@ -357,9 +358,8 @@ func (r *Room) StopRecording() error {
 						Payload: opusSilence,
 					}
 
-					if err := tw.writer.WriteRTP(silentPkt); err != nil {
-						fmt.Printf("error writing final silent packet for client %s track %s: %v", clientID, trackID, err)
-						// Continue processing other tracks even if one fails
+					if err := writeRTPWithSamples(tw.writer, silentPkt, uint64(samplesPerPacket)); err != nil {
+						fmt.Printf("error writing silent packet: %v", err)
 						break
 					}
 				}
@@ -492,4 +492,16 @@ func (r *Room) mergeAndUpload(session *recordingSession) error {
 	fmt.Printf("removing local files: %s", baseDir)
 	os.RemoveAll(baseDir)
 	return nil
+}
+
+func writeRTPWithSamples(w *oggwriter.OggWriter, p *rtp.Packet, samples uint64) error {
+	// Use reflection to access private field
+	writer := reflect.ValueOf(w).Elem()
+	granuleField := writer.FieldByName("granule")
+	if granuleField.IsValid() {
+		current := granuleField.Uint()
+		granuleField.SetUint(current + samples)
+	}
+
+	return w.WriteRTP(p)
 }
