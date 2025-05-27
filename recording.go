@@ -190,11 +190,9 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 
 			// Check for time gap (indicating mute period)
 			timeDiff := currentPacketTime.Sub(timeToCompareWith)
-			if timeDiff > 100*time.Millisecond {
+			if timeDiff > 500*time.Millisecond {
 				// Calculate number of packets needed to fill the gap
 				numPackets := int(timeDiff / (20 * time.Millisecond))
-
-				fmt.Printf("detected gap of %v, inserting %d silence packets", timeDiff, numPackets)
 
 				// Insert silence packets to fill the gap
 				for i := 0; i < numPackets; i++ {
@@ -215,7 +213,6 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 						Payload: opusSilence,
 					}
 
-					fmt.Printf("writing silence packet: seq=%d, ts=%d", silentPkt.SequenceNumber, silentPkt.Timestamp)
 					if err := writeRTPWithSamples(tw.writer, silentPkt, uint64(samplesPerPacket)); err != nil {
 						fmt.Printf("error writing silent packet: %v", err)
 						return
@@ -343,9 +340,6 @@ func (r *Room) StopRecording() error {
 
 				// Calculate samples per packet based on clock rate
 				samplesPerPacket := uint32(tw.clockRate * 20 / 1000) // 20ms worth of samples
-
-				fmt.Printf("client %s track %s: filling gap to session end, duration: %v, packets: %d",
-					clientID, trackID, timeDiff, numPackets)
 
 				// Insert silence packets to fill the gap to session end
 				for i := 0; i < numPackets; i++ {
