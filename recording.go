@@ -152,7 +152,7 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 			return err
 		}
 		// Create trackWriter with proper clock rate
-		session.writers[clientID][track.ID()] = &trackWriter{
+		tw := &trackWriter{
 			writer:           ow,
 			clockRate:        sampleRate, // 48000 for Opus
 			lastPacketTime:   time.Time{},
@@ -160,19 +160,13 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 			lastSeqNum:       0,
 			mu:               sync.Mutex{},
 		}
+		session.writers[clientID][track.ID()] = tw
 
 		track.OnRead(func(attrs interceptor.Attributes, pkt *rtp.Packet, q QualityLevel) {
 			go func() {
-				tw := session.writers[clientID][track.ID()]
-				if tw == nil {
-					return
-				}
 				tw.mu.Lock()
 				defer tw.mu.Unlock()
 
-				if session == nil {
-					return
-				}
 				if session.paused || session.stopped {
 					return
 				}
@@ -252,11 +246,24 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 
 	// Hook future client additions
 	r.OnClientJoined(func(c *Client) {
+
+		c.OnTracksAvailable(func(tracks []ITrack) {
+			go func() {
+				for _, track := range tracks {
+					if track.Kind() == webrtc.RTPCodecTypeAudio {
+						_ = addWriter(c.ID(), track)
+					}
+				}
+			}()
+		})
+
 		fmt.Printf("Client Joined: %s", c.ID())
 		for _, track := range c.Tracks() {
-			if track.Kind() == webrtc.RTPCodecTypeAudio {
-				_ = addWriter(c.ID(), track)
-			}
+			go func() {
+				if track.Kind() == webrtc.RTPCodecTypeAudio {
+					_ = addWriter(c.ID(), track)
+				}
+			}()
 		}
 	})
 
