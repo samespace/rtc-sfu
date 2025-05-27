@@ -161,86 +161,103 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 		}
 
 		track.OnRead(func(attrs interceptor.Attributes, pkt *rtp.Packet, q QualityLevel) {
-			if session.paused || session.stopped {
-				return
-			}
+			go func() {
+				tw := session.writers[clientID][track.ID()]
+				if tw == nil {
+					return
+				}
+				tw.mu.Lock()
+				defer tw.mu.Unlock()
 
-			tw := session.writers[clientID][track.ID()]
-			tw.mu.Lock()
-			defer tw.mu.Unlock()
+				if session == nil {
+					return
+				}
+				if session.paused || session.stopped {
+					return
+				}
 
-			// Current time when packet arrived
-			currentPacketTime := time.Now()
+				// Current time when packet arrived
+				currentPacketTime := time.Now()
 
-			// Determine the reference time for gap detection
-			timeToCompareWith := tw.lastPacketTime
-			if timeToCompareWith.IsZero() {
-				timeToCompareWith = session.meta.StartTime
-			}
+				// Determine the reference time for gap detection
+				timeToCompareWith := tw.lastPacketTime
+				if timeToCompareWith.IsZero() {
+					timeToCompareWith = session.meta.StartTime
+				}
 
-			// Initialize sequence number and timestamp for first packet
-			if tw.lastSeqNum == 0 {
-				tw.lastSeqNum = uint16(rand.IntN(1 << 16))
-				tw.lastRTPTimestamp = rand.Uint32()
-			}
+				// Initialize sequence number and timestamp for first packet
+				if tw.lastSeqNum == 0 {
+					tw.lastSeqNum = uint16(rand.IntN(1 << 16))
+					tw.lastRTPTimestamp = rand.Uint32()
+				}
 
-			// Calculate samples per packet based on clock rate (usually 960 for 20ms at 48kHz)
-			samplesPerPacket := uint32(tw.clockRate * 20 / 1000) // 20ms worth of samples
+				// Calculate samples per packet based on clock rate (usually 960 for 20ms at 48kHz)
+				samplesPerPacket := uint32(tw.clockRate * 20 / 1000) // 20ms worth of samples
 
-			// Check for time gap (indicating mute period)
-			timeDiff := currentPacketTime.Sub(timeToCompareWith)
-			if timeDiff > 100*time.Millisecond {
-				// Calculate number of packets needed to fill the gap
-				numPackets := int(timeDiff / (20 * time.Millisecond))
+				// Check for time gap (indicating mute period)
+				timeDiff := currentPacketTime.Sub(timeToCompareWith)
+				if timeDiff > 100*time.Millisecond {
+					// Calculate number of packets needed to fill the gap
+					numPackets := int(timeDiff / (20 * time.Millisecond))
 
-				// Insert silence packets to fill the gap
-				for i := 0; i < numPackets; i++ {
-					tw.lastSeqNum++
-					tw.lastRTPTimestamp += samplesPerPacket
+					// Insert silence packets to fill the gap
+					for i := 0; i < numPackets; i++ {
+						tw.lastSeqNum++
+						tw.lastRTPTimestamp += samplesPerPacket
 
-					// Proper Opus silence frame (DTX - Discontinuous Transmission)
-					opusSilence := []byte{0xF8, 0xFF, 0xFE} // Opus DTX frame
+						// Proper Opus silence frame (DTX - Discontinuous Transmission)
+						opusSilence := []byte{0xF8, 0xFF, 0xFE} // Opus DTX frame
 
-					silentPkt := &rtp.Packet{
-						Header: rtp.Header{
-							Version:        2,
-							PayloadType:    111, // Opus payload type
-							SequenceNumber: tw.lastSeqNum,
-							Timestamp:      tw.lastRTPTimestamp,
-							SSRC:           pkt.SSRC,
-						},
-						Payload: opusSilence,
-					}
+						silentPkt := &rtp.Packet{
+							Header: rtp.Header{
+								Version:        2,
+								PayloadType:    111, // Opus payload type
+								SequenceNumber: tw.lastSeqNum,
+								Timestamp:      tw.lastRTPTimestamp,
+								SSRC:           pkt.SSRC,
+							},
+							Payload: opusSilence,
+						}
 
-					if err := tw.writer.WriteRTP(silentPkt); err != nil {
-						fmt.Printf("error writing silent packet: %v", err)
-						return
+						if err := tw.writer.WriteRTP(silentPkt); err != nil {
+							fmt.Printf("error writing silent packet: %v", err)
+							return
+						}
 					}
 				}
-			}
 
-			// Process the actual packet
-			tw.lastSeqNum++
-			tw.lastRTPTimestamp += samplesPerPacket
+				// Process the actual packet
+				tw.lastSeqNum++
+				tw.lastRTPTimestamp += samplesPerPacket
 
-			// Create a copy to avoid modifying the original packet
-			actualPkt := *pkt
-			actualPkt.SequenceNumber = tw.lastSeqNum
-			actualPkt.Timestamp = tw.lastRTPTimestamp
+				// Create a copy to avoid modifying the original packet
+				pkt.SequenceNumber = tw.lastSeqNum
+				pkt.Timestamp = tw.lastRTPTimestamp
 
-			if err := tw.writer.WriteRTP(&actualPkt); err != nil {
-				fmt.Printf("error writing packet: %v", err)
-				return
-			}
+				if err := tw.writer.WriteRTP(pkt); err != nil {
+					fmt.Printf("error writing packet: %v", err)
+					return
+				}
 
-			// Update the last packet time for next gap detection
-			tw.lastPacketTime = currentPacketTime
+				// Update the last packet time for next gap detection
+				tw.lastPacketTime = currentPacketTime
+			}()
 		})
 
 		fmt.Printf("added writer for client %s, track %s", clientID, track.ID())
 
 		return nil
 	}
+
+	// Hook future client additions
+	r.OnClientJoined(func(c *Client) {
+		fmt.Printf("Client Joined: %s", c.ID())
+		for _, track := range c.Tracks() {
+			if track.Kind() == webrtc.RTPCodecTypeAudio {
+				_ = addWriter(c.ID(), track)
+			}
+		}
+	})
 
 	// Subscribe existing clients' tracks
 	for clientID, client := range r.SFU().clients.GetClients() {
@@ -254,26 +271,7 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 				}
 			}()
 		}
-
-		// add a hook for add track too
-		client.OnTracksAdded(func(tracks []ITrack) {
-			for _, track := range tracks {
-				if track.Kind() == webrtc.RTPCodecTypeAudio {
-					_ = addWriter(clientID, track)
-				}
-			}
-		})
 	}
-
-	// Hook future client additions
-	r.OnClientJoined(func(c *Client) {
-		fmt.Printf("Client Joined: %s", c.ID())
-		for _, track := range c.Tracks() {
-			if track.Kind() == webrtc.RTPCodecTypeAudio {
-				_ = addWriter(c.ID(), track)
-			}
-		}
-	})
 
 	r.recordingSession = session
 	return id, nil
