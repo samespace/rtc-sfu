@@ -231,6 +231,8 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 				actualPkt.SequenceNumber = tw.lastSeqNum
 				actualPkt.Timestamp = tw.lastRTPTimestamp
 
+				fmt.Printf("writing packet: %v", actualPkt)
+
 				if err := writeRTPWithSamples(tw.writer, &actualPkt, uint64(samplesPerPacket)); err != nil {
 					fmt.Printf("error writing packet: %v", err)
 					return
