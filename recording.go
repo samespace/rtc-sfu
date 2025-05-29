@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"time"
 
@@ -151,6 +152,8 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 
 		tw := session.writers[clientID][track.ID()]
 
+		samplesPerPacket := uint32(tw.clockRate * 20 / 1000) // 20ms worth of samples
+
 		track.OnRead(func(attrs interceptor.Attributes, pkt *rtp.Packet, q QualityLevel) {
 			go func() {
 				if session.paused || session.stopped {
@@ -160,10 +163,11 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 				tw.mu.Lock()
 				defer tw.mu.Unlock()
 
-				if err := tw.writer.WriteRTP(pkt); err != nil {
+				if err := writeRTPWithSamples(tw.writer, pkt, uint64(samplesPerPacket)); err != nil {
 					fmt.Printf("error writing packet: %v", err)
 					return
 				}
+
 			}()
 		})
 
@@ -289,4 +293,16 @@ func (r *Room) StopRecording() error {
 	r.recordingSession = nil
 	r.recordingMu.Unlock()
 	return nil
+}
+
+func writeRTPWithSamples(w *oggwriter.OggWriter, p *rtp.Packet, samples uint64) error {
+	// Use reflection to access private field
+	writer := reflect.ValueOf(w).Elem()
+	granuleField := writer.FieldByName("granule")
+	if granuleField.IsValid() {
+		current := granuleField.Uint()
+		granuleField.SetUint(current + samples)
+	}
+
+	return w.WriteRTP(p)
 }
