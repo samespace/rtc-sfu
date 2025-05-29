@@ -117,7 +117,7 @@ func newbitrateController(client *Client, qualityLevels []QualityLevel) *bitrate
 		log:                  logging.NewDefaultLoggerFactory().NewLogger("bitratecontroller"),
 	}
 
-	go bc.loopMonitor()
+	// go bc.loopMonitor()
 
 	return bc
 }

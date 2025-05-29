@@ -108,13 +108,18 @@ func newTrack(ctx context.Context, client *Client, trackRemote IRemoteTrack, min
 	onRead := func(attrs interceptor.Attributes, p *rtp.Packet) {
 		tracks := t.base.clientTracks.GetTracks()
 
+		// Use a sync.WaitGroup for parallel packet forwarding
+		var wg sync.WaitGroup
+
 		for _, track := range tracks {
-			//nolint:ineffassign,staticcheck // packet is from the pool
-			packet := pool.CopyPacket(p)
-
-			track.push(packet, QualityHigh)
-
-			pool.PutPacket(packet)
+			wg.Add(1)
+			go func(ct iClientTrack) {
+				defer wg.Done()
+				//nolint:ineffassign,staticcheck // packet is from the pool
+				packet := pool.CopyPacket(p)
+				ct.push(packet, QualityHigh)
+				pool.PutPacket(packet)
+			}(track)
 		}
 
 		//nolint:ineffassign // this is required
@@ -123,6 +128,9 @@ func newTrack(ctx context.Context, client *Client, trackRemote IRemoteTrack, min
 		t.onRead(attrs, packet, QualityHigh)
 
 		pool.PutPacket(packet)
+
+		// Wait for all forwarding to complete
+		wg.Wait()
 	}
 
 	onNetworkConditionChanged := func(condition networkmonitor.NetworkConditionType) {
