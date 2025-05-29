@@ -2,6 +2,7 @@ package sfu
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -100,6 +101,8 @@ func DefaultRoomOptions() RoomOptions {
 
 func newRoom(id, name string, sfu *SFU, kind string, opts RoomOptions) *Room {
 	localContext, cancel := context.WithCancel(sfu.context)
+
+	fmt.Println("NEW ROOM: 1.12.5")
 
 	room := &Room{
 		id:         id,
