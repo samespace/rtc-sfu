@@ -203,6 +203,15 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 				_ = addWriter(c.ID(), track)
 			}
 		}
+
+		// add a hook for add track too
+		c.OnTracksReady(func(tracks []ITrack) {
+			for _, track := range tracks {
+				if track.Kind() == webrtc.RTPCodecTypeAudio {
+					_ = addWriter(c.ID(), track)
+				}
+			}
+		})
 	})
 
 	r.recordingSession = session
