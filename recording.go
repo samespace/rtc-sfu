@@ -115,10 +115,7 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 
 		session.mu.Lock()
 		defer session.mu.Unlock()
-		channel := cfg.ChannelMapping[clientID]
-		if channel == ChannelUnknown {
-			return nil
-		}
+
 		if _, ok := session.writers[clientID]; !ok {
 			session.writers[clientID] = make(map[string]*trackWriter)
 		}
@@ -279,6 +276,15 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 				_ = addWriter(c.ID(), track)
 			}
 		}
+
+		// add a hook for add track too
+		c.OnTracksReady(func(tracks []ITrack) {
+			for _, track := range tracks {
+				if track.Kind() == webrtc.RTPCodecTypeAudio {
+					_ = addWriter(c.ID(), track)
+				}
+			}
+		})
 	})
 
 	r.recordingSession = session
@@ -398,11 +404,11 @@ func (r *Room) StopRecording() error {
 	}
 
 	// Merge channels and upload to S3
-	go func() {
-		if err := r.mergeAndUpload(session); err != nil {
-			fmt.Printf("error merging and uploading: %v", err)
-		}
-	}()
+	// go func() {
+	// 	if err := r.mergeAndUpload(session); err != nil {
+	// 		fmt.Printf("error merging and uploading: %v", err)
+	// 	}
+	// }()
 
 	r.recordingMu.Lock()
 	r.recordingSession = nil
