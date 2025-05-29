@@ -156,12 +156,10 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 
 		track.OnRead(func(attrs interceptor.Attributes, pkt *rtp.Packet, q QualityLevel) {
 			go func() {
-				if session.paused || session.stopped {
-					return
-				}
-
 				tw.mu.Lock()
 				defer tw.mu.Unlock()
+
+				fmt.Printf("writing packet: %v", pkt)
 
 				if err := writeRTPWithSamples(tw.writer, pkt, uint64(samplesPerPacket)); err != nil {
 					fmt.Printf("error writing packet: %v", err)
