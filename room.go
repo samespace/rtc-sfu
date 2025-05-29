@@ -69,9 +69,7 @@ type Room struct {
 	OnEvent                 func(event Event)
 	options                 RoomOptions
 
-	// recording management
-	recordingSession *recordingSession
-	recordingMu      sync.Mutex
+	recordingMu sync.Mutex
 }
 
 type RoomOptions struct {
