@@ -1,20 +1,14 @@
 package sfu
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"reflect"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/minio/minio-go/v7"
-	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/pion/interceptor"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
@@ -39,9 +33,7 @@ type S3Config struct {
 }
 
 type RecordingConfig struct {
-	BasePath       string
-	ChannelMapping map[string]ChannelType
-	S3             S3Config
+	BasePath string
 }
 
 type recordingSession struct {
@@ -114,10 +106,7 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 
 		session.mu.Lock()
 		defer session.mu.Unlock()
-		channel := cfg.ChannelMapping[clientID]
-		if channel == ChannelUnknown {
-			return nil
-		}
+
 		if _, ok := session.writers[clientID]; !ok {
 			session.writers[clientID] = make(map[string]*trackWriter)
 		}
@@ -171,10 +160,7 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 				tw.mu.Lock()
 				defer tw.mu.Unlock()
 
-				// Calculate samples per packet based on clock rate (usually 960 for 20ms at 48kHz)
-				samplesPerPacket := uint32(tw.clockRate * 20 / 1000) // 20ms worth of samples
-
-				if err := writeRTPWithSamples(tw.writer, pkt, uint64(samplesPerPacket)); err != nil {
+				if err := tw.writer.WriteRTP(pkt); err != nil {
 					fmt.Printf("error writing packet: %v", err)
 					return
 				}
@@ -294,109 +280,4 @@ func (r *Room) StopRecording() error {
 	r.recordingSession = nil
 	r.recordingMu.Unlock()
 	return nil
-}
-
-// mergeAndUpload mixes per-channel recordings, merges stereo, uploads to S3, and removes local files.
-func (r *Room) mergeAndUpload(session *recordingSession) error {
-	baseDir := filepath.Join(session.cfg.BasePath, session.id)
-	// Group track files by channel
-	filesByChannel := map[ChannelType][]string{}
-	for clientID, writerMap := range session.writers {
-		ch := session.cfg.ChannelMapping[clientID]
-		for trackID := range writerMap {
-			filesByChannel[ch] = append(filesByChannel[ch], filepath.Join(baseDir, clientID, fmt.Sprintf("%s.ogg", trackID)))
-		}
-	}
-	// Create mono mixes per channel
-	monoFiles := map[ChannelType]string{}
-	for _, ch := range []ChannelType{ChannelOne, ChannelTwo} {
-		inputs := filesByChannel[ch]
-		if len(inputs) == 0 {
-			continue
-		}
-		monoPath := filepath.Join(baseDir, fmt.Sprintf("mono_%d.ogg", ch))
-		if len(inputs) == 1 {
-			src := inputs[0]
-			inF, err := os.Open(src)
-			if err != nil {
-				return fmt.Errorf("copy file for channel %d failed: %v", ch, err)
-			}
-			defer inF.Close()
-			outF, err := os.Create(monoPath)
-			if err != nil {
-				return fmt.Errorf("copy file for channel %d failed: %v", ch, err)
-			}
-			defer outF.Close()
-			if _, err := io.Copy(outF, inF); err != nil {
-				return fmt.Errorf("copy file for channel %d failed: %v", ch, err)
-			}
-			monoFiles[ch] = monoPath
-			continue
-		}
-		args := []string{"-y"}
-		for _, in := range inputs {
-			args = append(args, "-i", in)
-		}
-		filter := fmt.Sprintf("amix=inputs=%d:duration=longest", len(inputs))
-		args = append(args, "-filter_complex", filter, "-ac", "1", monoPath)
-		cmd := exec.Command("ffmpeg", args...)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("ffmpeg mix channel %d failed: %v, output: %s", ch, err, string(out))
-		}
-		monoFiles[ch] = monoPath
-	}
-	// Merge to stereo
-	finalPath := filepath.Join(baseDir, session.id+".ogg")
-	left, hasLeft := monoFiles[ChannelOne]
-	right, hasRight := monoFiles[ChannelTwo]
-	if hasLeft && hasRight {
-		cmd := exec.Command("ffmpeg", "-y", "-i", left, "-i", right, "-filter_complex", "amerge=inputs=2", "-ac", "2", finalPath)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("ffmpeg merge stereo failed: %v, output: %s", err, string(out))
-		}
-	} else if hasLeft || hasRight {
-		src := left
-		if !hasLeft {
-			src = right
-		}
-		if err := os.Rename(src, finalPath); err != nil {
-			return err
-		}
-	} else {
-		return fmt.Errorf("no audio to merge")
-	}
-	// Upload to S3
-	mc, err := minio.New(session.cfg.S3.Endpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(session.cfg.S3.AccessKey, session.cfg.S3.SecretKey, ""),
-		Secure: session.cfg.S3.Secure,
-	})
-	if err != nil {
-		fmt.Printf("error creating minio client: %v", err)
-		return err
-	}
-	object := filepath.Join(session.cfg.S3.FilePrefix, session.id+".ogg")
-	ctx := context.Background()
-	_, err = mc.FPutObject(ctx, session.cfg.S3.Bucket, object, finalPath, minio.PutObjectOptions{ContentType: "audio/ogg"})
-	if err != nil {
-		fmt.Printf("error uploading to s3: %v", err)
-		return err
-	}
-
-	fmt.Printf("uploaded to s3: %s", object)
-	fmt.Printf("removing local files: %s", baseDir)
-	// Cleanup local files
-	os.RemoveAll(baseDir)
-	return nil
-}
-
-func writeRTPWithSamples(w *oggwriter.OggWriter, p *rtp.Packet, samples uint64) error {
-	// Use reflection to access private field
-	writer := reflect.ValueOf(w).Elem()
-	granuleField := writer.FieldByName("granule")
-	if granuleField.IsValid() {
-		current := granuleField.Uint()
-		granuleField.SetUint(current + samples)
-	}
-
-	return w.WriteRTP(p)
 }
