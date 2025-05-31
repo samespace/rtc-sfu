@@ -2078,14 +2078,6 @@ func (c *Client) Play(ctx context.Context, endpoint, method, body string, loop b
 			c.playLock.Unlock()
 			return nil
 
-		case <-ctx.Done():
-			fmt.Println("client: context done, stopping playback")
-			c.log.Infof("client: context done, stopping playback")
-			c.playLock.Lock()
-			c.playing = false
-			c.playLock.Unlock()
-			return nil
-
 		case <-ticker.C:
 			packet, err := oggReader.ReadPacket()
 			if errors.Is(err, io.EOF) {
