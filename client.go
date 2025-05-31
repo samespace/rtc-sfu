@@ -2005,14 +2005,8 @@ func (c *Client) UnholdAllTracks() error {
 
 // StopPlay stops any ongoing playback.
 func (c *Client) StopPlay() {
-	fmt.Println("client: stop play called")
-	fmt.Println("is playing", c.isPlaying.Load())
-	fmt.Println("player stop", c.playerStop)
-
 	if c.isPlaying.Load() && c.playerStop != nil {
-		fmt.Println("client: stop play called 2")
 		close(c.playerStop)
-		fmt.Println("client: stop play called 3")
 	}
 }
 
@@ -2048,10 +2042,6 @@ func (c *Client) Play(ctx context.Context, endpoint, method, body string, loop b
 	if err != nil {
 		return err
 	}
-
-	fmt.Println("client: playing")
-	fmt.Println("player stop", c.playerStop)
-	fmt.Println("is playing", c.isPlaying.Load())
 
 	for {
 		select {
