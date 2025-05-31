@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/inlivedev/sfu/pkg/interceptors/playoutdelay"
 	"github.com/inlivedev/sfu/pkg/interceptors/voiceactivedetector"
 	"github.com/inlivedev/sfu/pkg/networkmonitor"
@@ -23,6 +24,7 @@ import (
 	"github.com/pion/logging"
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
+	"github.com/pion/webrtc/v4/pkg/media"
 )
 
 type ClientState int
@@ -191,6 +193,12 @@ type Client struct {
 	vadInterceptor                 *voiceactivedetector.Interceptor
 	vads                           map[uint32]*voiceactivedetector.VoiceDetector
 	log                            logging.LeveledLogger
+
+	// play state
+	playLock        sync.Mutex
+	playing         bool
+	playerOutTrack  *webrtc.TrackLocalStaticSample
+	stopPlayingChan chan struct{}
 }
 
 func DefaultClientOptions() ClientOptions {
@@ -352,7 +360,28 @@ func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Confi
 		vadInterceptor:                 vadInterceptor,
 		vads:                           vads,
 		log:                            opts.Log,
+		playLock:                       sync.Mutex{},
+		playing:                        false,
+		playerOutTrack:                 nil,
+		stopPlayingChan:                make(chan struct{}),
 	}
+
+	// Create a new Opus track for playback
+	playerTrackID := fmt.Sprintf("player-track-%s", uuid.New().String())
+	playerStreamID := fmt.Sprintf("player-stream-%s", uuid.New().String())
+	track, err := webrtc.NewTrackLocalStaticSample(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus},
+		playerTrackID, playerStreamID,
+	)
+	if err == nil {
+		client.playerOutTrack = track
+	}
+
+	// Add track to peer connection, will trigger renegotiation
+	_, err = client.peerConnection.PC().AddTransceiverFromTrack(
+		track,
+		webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendonly},
+	)
 
 	client.onTrack = func(track ITrack) {
 		if err := client.pendingPublishedTracks.Add(track); err == ErrTrackExists {
@@ -1985,4 +2014,98 @@ func (c *Client) UnholdAllTracks() error {
 		}
 	}
 	return firstError
+}
+
+// IsPlaying returns whether audio playback is ongoing.
+func (c *Client) IsPlaying() bool {
+	c.playLock.Lock()
+	defer c.playLock.Unlock()
+	return c.playing
+}
+
+// StopPlay stops any ongoing playback.
+func (c *Client) StopPlay() {
+	c.playLock.Lock()
+	defer c.playLock.Unlock()
+	if c.playing {
+		close(c.stopPlayingChan)
+	}
+}
+
+// Play streams OGG Opus audio from the given endpoint to this client. It blocks until playback is stopped or completes.
+func (c *Client) Play(ctx context.Context, endpoint, method, body string, loop bool) error {
+	if c.IsPlaying() {
+		return errors.New("already playing")
+	}
+	// Mark playing and initialize stop channel
+	c.playLock.Lock()
+	c.playing = true
+	c.stopPlayingChan = make(chan struct{})
+	c.playLock.Unlock()
+
+	// Fetch and read OGG packets
+	file, err := GetFile(endpoint, method, body)
+	if err != nil {
+		return err
+	}
+	oggReader, oggHeader, err := NewOggReader(file, loop)
+	if err != nil {
+		return err
+	}
+	c.log.Infof("client: OGG Header details - Channels: %d, SampleRate: %d", oggHeader.Channels, oggHeader.SampleRate)
+
+	// Playback ticker
+	ticker := time.NewTicker(time.Millisecond * 20)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.stopPlayingChan:
+			c.log.Infof("client: stopping playback")
+			c.playLock.Lock()
+			c.playing = false
+			c.playLock.Unlock()
+			return nil
+
+		case <-ctx.Done():
+			c.log.Infof("client: context done, stopping playback")
+			c.playLock.Lock()
+			c.playing = false
+			c.playLock.Unlock()
+			return nil
+
+		case <-ticker.C:
+			packet, err := oggReader.ReadPacket()
+			if errors.Is(err, io.EOF) {
+				if loop {
+					file, err = GetFile(endpoint, method, body)
+					if err != nil {
+						return err
+					}
+					oggReader, _, err = NewOggReader(file, loop)
+					if err != nil {
+						return err
+					}
+					continue
+				}
+				// Playback complete
+				c.playLock.Lock()
+				c.playing = false
+				c.playLock.Unlock()
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+
+			// Determine packet duration and write sample
+			dur, err := ParsePacketDuration(packet)
+			if err != nil {
+				return err
+			}
+			if err := c.playerOutTrack.WriteSample(media.Sample{Data: packet, Duration: dur}); err != nil {
+				return err
+			}
+		}
+	}
 }
