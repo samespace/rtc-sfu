@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/inlivedev/sfu/pkg/packetmap"
 	"github.com/inlivedev/sfu/pkg/rtppool"
 	"github.com/pion/interceptor"
 	"github.com/pion/logging"
@@ -358,6 +359,7 @@ func (t *PlayerTrack) subscribe(c *Client) iClientTrack {
 		localTrack:            localTrack,
 		remoteTrack:           nil, // Player tracks don't have remote tracks
 		baseTrack:             t.base,
+		packetmap:             &packetmap.Map{}, // Initialize the packetmap
 		isScreen:              false,
 		ssrc:                  webrtc.SSRC(t.base.codec.PayloadType),
 		onTrackEndedCallbacks: make([]func(), 0),
