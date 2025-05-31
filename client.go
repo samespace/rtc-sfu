@@ -2041,6 +2041,8 @@ func (c *Client) Play(ctx context.Context, endpoint, method, body string, loop b
 	c.stopPlayingChan = make(chan struct{})
 	c.playLock.Unlock()
 
+	fmt.Println("client: playing", endpoint, method, body, loop)
+
 	// Fetch and read OGG packets
 	file, err := GetFile(endpoint, method, body)
 	if err != nil {
@@ -2059,6 +2061,7 @@ func (c *Client) Play(ctx context.Context, endpoint, method, body string, loop b
 	for {
 		select {
 		case <-c.stopPlayingChan:
+			fmt.Println("client: stopping playback")
 			c.log.Infof("client: stopping playback")
 			c.playLock.Lock()
 			c.playing = false
@@ -2066,6 +2069,7 @@ func (c *Client) Play(ctx context.Context, endpoint, method, body string, loop b
 			return nil
 
 		case <-ctx.Done():
+			fmt.Println("client: context done, stopping playback")
 			c.log.Infof("client: context done, stopping playback")
 			c.playLock.Lock()
 			c.playing = false
@@ -2101,6 +2105,7 @@ func (c *Client) Play(ctx context.Context, endpoint, method, body string, loop b
 			if err != nil {
 				return err
 			}
+			fmt.Println("client: writing sample", dur)
 			if err := c.playerOutTrack.WriteSample(media.Sample{Data: packet, Duration: dur}); err != nil {
 				return err
 			}
