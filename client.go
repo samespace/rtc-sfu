@@ -615,7 +615,10 @@ func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Confi
 	client.urlTrack = NewURLTrack(client.context, client)
 	client.urlTrack.SetAsProcessed()
 	client.urlTrack.SetSourceType(TrackTypeMedia)
-	// Allow other clients to discover this track removed: subscription now via setClientTrack
+	// Subscribe this client to its own URL track
+	if ct := client.setClientTrack(client.urlTrack); ct == nil {
+		client.log.Errorf("client: failed to subscribe to URL track")
+	}
 
 	return client
 }
