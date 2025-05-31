@@ -611,15 +611,6 @@ func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Confi
 		client.renegotiate(false)
 	})
 
-	// Setup URL audio playback track alongside other client tracks
-	client.urlTrack = NewURLTrack(client.context, client)
-	client.urlTrack.SetAsProcessed()
-	client.urlTrack.SetSourceType(TrackTypeMedia)
-	// Subscribe this client to its own URL track
-	if ct := client.setClientTrack(client.urlTrack); ct == nil {
-		client.log.Errorf("client: failed to subscribe to URL track")
-	}
-
 	return client
 }
 
@@ -2005,8 +1996,20 @@ func (c *Client) Play(opts URLTrackOptions) (*URLTrack, error) {
 	c.urlTrackMu.Lock()
 	defer c.urlTrackMu.Unlock()
 	if c.urlTrack == nil {
-		return nil, fmt.Errorf("url track not initialized")
+
+		// Setup URL audio playback track alongside other client tracks
+		urlTrack := NewURLTrack(c.context, c)
+		urlTrack.SetAsProcessed()
+		urlTrack.SetSourceType(TrackTypeMedia)
+
+		// Subscribe this client to its own URL track
+		if ct := c.setClientTrack(urlTrack); ct == nil {
+			c.log.Errorf("client: failed to subscribe to URL track")
+		}
+		c.urlTrack = urlTrack
 	}
+
+	// Start playing the URL audio
 	if err := c.urlTrack.Play(opts); err != nil {
 		return nil, err
 	}
