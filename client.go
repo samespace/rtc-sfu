@@ -365,7 +365,6 @@ func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Confi
 		// player
 		playerTrack: playerTrack,
 		isPlaying:   &atomic.Bool{},
-		playerStop:  make(chan bool),
 	}
 
 	client.onTrack = func(track ITrack) {
@@ -1187,7 +1186,7 @@ func (c *Client) afterClosed() {
 	c.cancel()
 
 	// close player stop chan
-	close(c.playerStop)
+	c.StopPlay()
 }
 
 func (c *Client) stop() error {
@@ -2006,11 +2005,8 @@ func (c *Client) UnholdAllTracks() error {
 
 // StopPlay stops any ongoing playback.
 func (c *Client) StopPlay() {
-	fmt.Println("client: stop play called")
-	if c.isPlaying.Load() {
-		fmt.Println("client: stop play called 2")
-		c.playerStop <- true
-		fmt.Println("client: stop play called 3")
+	if c.isPlaying.Load() && c.playerStop != nil {
+		close(c.playerStop)
 	}
 }
 
@@ -2019,6 +2015,8 @@ func (c *Client) Play(ctx context.Context, endpoint, method, body string, loop b
 	if c.isPlaying.Load() {
 		return errors.New("already playing")
 	}
+
+	c.playerStop = make(chan bool)
 
 	playerTrack := c.playerTrack
 	if playerTrack == nil {
@@ -2040,6 +2038,7 @@ func (c *Client) Play(ctx context.Context, endpoint, method, body string, loop b
 	ticker := time.NewTicker(time.Millisecond * 20)
 	defer func() {
 		fmt.Println("client: stopping play")
+		c.playerStop = nil
 		c.isPlaying.Store(false)
 		ticker.Stop()
 	}()
