@@ -342,6 +342,21 @@ func (t *PlayerTrack) createLocalTrack() *webrtc.TrackLocalStaticRTP {
 	return track
 }
 
+// playerClientTrack is a custom clientTrack for PlayerTrack that handles nil remoteTrack
+type playerClientTrack struct {
+	*clientTrack
+}
+
+// Kind overrides the Kind method to use the stored kind field instead of remoteTrack
+func (t *playerClientTrack) Kind() webrtc.RTPCodecType {
+	return t.kind
+}
+
+// RequestPLI overrides to handle nil remoteTrack
+func (t *playerClientTrack) RequestPLI() {
+	// Player tracks don't have remote tracks, so no PLI to send
+}
+
 // subscribe allows a client to subscribe to this player track
 func (t *PlayerTrack) subscribe(c *Client) iClientTrack {
 	localTrack := t.createLocalTrack()
@@ -365,11 +380,16 @@ func (t *PlayerTrack) subscribe(c *Client) iClientTrack {
 		onTrackEndedCallbacks: make([]func(), 0),
 	}
 
+	// Wrap in playerClientTrack to handle nil remoteTrack
+	pct := &playerClientTrack{
+		clientTrack: ct,
+	}
+
 	t.OnEnded(func() {
-		ct.onEnded()
+		pct.onEnded()
 		cancel()
 	})
 
-	t.base.clientTracks.Add(ct)
-	return ct
+	t.base.clientTracks.Add(pct)
+	return pct
 }
