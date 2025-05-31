@@ -2007,10 +2007,9 @@ func (c *Client) UnholdAllTracks() error {
 // StopPlay stops any ongoing playback.
 func (c *Client) StopPlay() {
 	fmt.Println("client: stop play called")
-	// signal Play loop to stop
-	select {
-	case c.playerStop <- struct{}{}:
-	default:
+	if c.isPlaying.Load() {
+		// signal Play loop to stop
+		c.playerStop <- struct{}{}
 	}
 	// Mark as not playing
 	c.isPlaying.Store(false)
