@@ -1304,7 +1304,7 @@ func (c *Client) onLeft() {
 	defer c.muCallback.Unlock()
 
 	// stop playback
-	c.StopPlay()
+	go c.StopPlay()
 
 	for _, callback := range c.onLeftCallbacks {
 		go callback()
@@ -2007,15 +2007,13 @@ func (c *Client) UnholdAllTracks() error {
 // StopPlay stops any ongoing playback.
 func (c *Client) StopPlay() {
 	fmt.Println("client: stop play called")
-	if c.isPlaying.Load() {
-		fmt.Println("client: stop play called 2")
-		select {
-		case c.playerStop <- struct{}{}:
-		default:
-		}
-		c.isPlaying.Store(false)
+	// signal Play loop to stop
+	select {
+	case c.playerStop <- struct{}{}:
+	default:
 	}
-	fmt.Println("client: stop play called 3")
+	// Mark as not playing
+	c.isPlaying.Store(false)
 }
 
 // Play streams OGG Opus audio from the given endpoint to this client. It blocks until playback is stopped or completes.
@@ -2042,13 +2040,15 @@ func (c *Client) Play(ctx context.Context, endpoint, method, body string, loop b
 
 	// Playback ticker
 	ticker := time.NewTicker(time.Millisecond * 20)
-	defer ticker.Stop()
+	defer func() {
+		fmt.Println("client: stopping play")
+		c.isPlaying.Store(false)
+		ticker.Stop()
+	}()
 
 	for {
 		select {
 		case <-c.playerStop:
-			c.isPlaying.Store(false)
-			fmt.Println("client: stopping playback")
 			return nil
 
 		case <-ticker.C:
@@ -2065,7 +2065,6 @@ func (c *Client) Play(ctx context.Context, endpoint, method, body string, loop b
 					}
 					continue
 				}
-				c.isPlaying.Store(false)
 				return nil
 			}
 			if err != nil {
