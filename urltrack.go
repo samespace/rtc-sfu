@@ -224,23 +224,29 @@ func (t *URLTrack) playOnce(opts URLTrackOptions) error {
 	for {
 		select {
 		case <-t.context.Done():
+			fmt.Println("urltrack: context done")
 			return io.EOF
 		case <-t.stopCh:
+			fmt.Println("urltrack: stop")
 			return io.EOF
 		case <-tick.C:
 			pkt, err := ogg.ReadPacket()
 			if err != nil {
+				fmt.Println("urltrack: read packet error", err)
 				return err
 			}
 			_, err = ParsePacketDuration(pkt)
 			if err != nil {
+				fmt.Println("urltrack: parse packet duration error", err)
 				return err
 			}
 			r := &rtp.Packet{Header: rtp.Header{Version: 2, PayloadType: uint8(t.base.codec.PayloadType), SSRC: uint32(t.base.codec.PayloadType)}, Payload: pkt}
 			for _, ct := range t.base.clientTracks.GetTracks() {
+				fmt.Println("urltrack: push packet to client track", ct.ID())
 				x := r.Clone()
 				ct.push(x, QualityAudio)
 			}
+			fmt.Println("urltrack: trigger read")
 			t.triggerRead(nil, r, QualityAudio)
 		}
 	}
