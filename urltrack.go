@@ -264,7 +264,8 @@ func (t *URLTrack) subscribe(c *Client) iClientTrack {
 
 	ctx, cancel := context.WithCancel(t.Context())
 
-	ct := &clientTrack{
+	// build the base clientTrack
+	baseCT := &clientTrack{
 		id:                    localTrack.ID(),
 		streamid:              localTrack.StreamID(),
 		context:               ctx,
@@ -273,19 +274,22 @@ func (t *URLTrack) subscribe(c *Client) iClientTrack {
 		kind:                  t.base.kind,
 		mimeType:              t.base.codec.MimeType,
 		localTrack:            localTrack,
-		remoteTrack:           nil, // URLTrack has no remote input
+		remoteTrack:           nil,
 		baseTrack:             t.base,
 		packetmap:             &packetmap.Map{},
 		isScreen:              false,
 		onTrackEndedCallbacks: make([]func(), 0),
 	}
-	t.base.clientTracks.Add(ct)
+	// wrap it so we override Kind/push
+	urlCT := &urlClientTrack{clientTrack: baseCT}
+	// register track in base list so playOnce will use urlClientTrack
+	t.base.clientTracks.Add(urlCT)
+	// cleanup on end
 	t.OnEnded(func() {
-		ct.onEnded()
+		urlCT.onEnded()
 		cancel()
 	})
-
-	return &urlClientTrack{clientTrack: ct}
+	return urlCT
 }
 
 // urlClientTrack wraps clientTrack to override Kind, RequestPLI, and push for URL playback
