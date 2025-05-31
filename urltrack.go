@@ -35,6 +35,7 @@ type URLTrack struct {
 	onEndedCallbacks []func()
 	isPlaying        *atomic.Bool
 	stopCh           chan struct{}
+	nextTimestamp    uint32 // cumulative RTP timestamp
 	log              logging.LeveledLogger
 }
 
@@ -75,6 +76,7 @@ func NewURLTrack(ctx context.Context, client *Client) *URLTrack {
 		onEndedCallbacks: make([]func(), 0),
 		isPlaying:        &atomic.Bool{},
 		stopCh:           make(chan struct{}, 1),
+		nextTimestamp:    0,
 		log:              client.log,
 	}
 	return ut
@@ -182,6 +184,8 @@ func (t *URLTrack) Play(opts URLTrackOptions) error {
 	if t.IsPlaying() {
 		return errors.New("already playing")
 	}
+	// reset timestamp at start of playback
+	t.nextTimestamp = 0
 	t.isPlaying.Store(true)
 	fmt.Println("urltrack: start", opts.URL, opts.Loop)
 	go func() {
@@ -235,12 +239,28 @@ func (t *URLTrack) playOnce(opts URLTrackOptions) error {
 				fmt.Println("urltrack: read packet error", err)
 				return err
 			}
-			_, err = ParsePacketDuration(pkt)
+			// determine duration for RTP timestamp
+			dur, err := ParsePacketDuration(pkt)
 			if err != nil {
 				fmt.Println("urltrack: parse packet duration error", err)
 				return err
 			}
-			r := &rtp.Packet{Header: rtp.Header{Version: 2, PayloadType: uint8(t.base.codec.PayloadType), SSRC: uint32(t.base.codec.PayloadType)}, Payload: pkt}
+			// build RTP packet with advancing timestamp
+			r := &rtp.Packet{
+				Header: rtp.Header{
+					Version:     2,
+					PayloadType: uint8(t.base.codec.PayloadType),
+					Timestamp:   t.nextTimestamp,
+					SSRC:        uint32(t.base.codec.PayloadType),
+				},
+				Payload: pkt,
+			}
+			// advance timestamp for next packet (convert play time to sample count)
+			// dur is in time.Duration (e.g., 20ms), ClockRate is samples/sec (e.g., 48000)
+			ms := dur.Milliseconds()
+			delta := uint32(ms * int64(t.base.codec.ClockRate) / 1000)
+			t.nextTimestamp += delta
+
 			for _, ct := range t.base.clientTracks.GetTracks() {
 				fmt.Println("urltrack: push packet to client track", ct.ID())
 				x := r.Clone()
