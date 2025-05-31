@@ -194,8 +194,6 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 				// Calculate number of packets needed to fill the gap
 				numPackets := int(timeDiff / (20 * time.Millisecond))
 
-				fmt.Printf("detected gap of %v, inserting %d silence packets", timeDiff, numPackets)
-
 				// Insert silence packets to fill the gap
 				for i := 0; i < numPackets; i++ {
 					tw.lastSeqNum++
@@ -321,6 +319,9 @@ func (r *Room) ResumeRecording() error {
 
 // StopRecording stops the recording session, closes files, and writes metadata.
 func (r *Room) StopRecording() error {
+
+	fmt.Printf("stopping recording: %s", r.recordingSession.id)
+
 	r.recordingMu.Lock()
 	session := r.recordingSession
 	r.recordingMu.Unlock()
@@ -384,12 +385,17 @@ func (r *Room) StopRecording() error {
 	}
 	session.mu.Unlock()
 
+	fmt.Printf("closing writers: %s", session.id)
+
 	// Close writers
 	for _, m := range session.writers {
 		for _, tw := range m {
 			tw.writer.Close()
 		}
 	}
+
+	fmt.Printf("writing meta.json: %s", session.id)
+
 	// Write meta.json
 	metaFile := filepath.Join(session.cfg.BasePath, session.id, "meta.json")
 	f, err := os.Create(metaFile)
@@ -402,6 +408,8 @@ func (r *Room) StopRecording() error {
 	if err := enc.Encode(session.meta); err != nil {
 		return err
 	}
+
+	fmt.Printf("merging and uploading: %s", session.id)
 
 	// Merge channels and upload to S3
 	go func() {
