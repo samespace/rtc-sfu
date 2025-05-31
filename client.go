@@ -336,6 +336,16 @@ func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Confi
 			fmt.Println("error adding player track", err)
 		}
 	}
+	go func() {
+		for i := 0; i < 50; i++ {
+			// write silence to player track
+			silenceSample := media.Sample{Data: OpusSilenceFrame, Duration: time.Millisecond * 20}
+			err := playerOutTrack.WriteSample(silenceSample)
+			if err != nil {
+				fmt.Println("(player) error writing silence sample", err)
+			}
+		}
+	}()
 
 	var stateNew atomic.Value
 	stateNew.Store(ClientStateNew)
