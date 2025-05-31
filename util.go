@@ -5,8 +5,11 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
@@ -536,4 +539,39 @@ func copyRTPPacket(packet *rtp.Packet) *rtp.Packet {
 	newPacket.Payload = make([]byte, len(packet.Payload))
 	copy(newPacket.Payload, packet.Payload)
 	return newPacket
+}
+
+func GetFile(endpoint string, method string, body string) (io.Reader, error) {
+	var req *http.Request
+	var err error
+
+	// Create request based on method
+	if method == "POST" {
+		req, err = http.NewRequest(method, endpoint, strings.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		fmt.Println("POST", endpoint, body)
+	} else {
+		req, err = http.NewRequest(method, endpoint, nil)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Send request
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check status code
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		resp.Body.Close() // Ensure we don't leak resources on error
+		return nil, fmt.Errorf("failed to fetch file: status code %d", resp.StatusCode)
+	}
+
+	return resp.Body, nil
 }

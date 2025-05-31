@@ -42,25 +42,6 @@ type PlayerOptions struct {
 	Loop   bool   // Whether to loop the audio
 }
 
-// AudioUtilsInterface defines the interface for audio utilities
-// This should be implemented by your utils package
-type AudioUtilsInterface interface {
-	GetFile(endpoint, method, body string) (io.ReadCloser, error)
-	NewOggReader(file io.ReadCloser, loop bool) (OggReaderInterface, *OggHeader, error)
-	ParsePacketDuration(packet []byte) (time.Duration, error)
-}
-
-// OggReaderInterface defines the interface for OGG reading
-type OggReaderInterface interface {
-	ReadPacket() ([]byte, error)
-}
-
-// OggHeader contains OGG file header information
-type OggHeader struct {
-	Channels   uint16
-	SampleRate uint32
-}
-
 // newPlayerTrack creates a new player track
 func newPlayerTrack(ctx context.Context, client *Client) *PlayerTrack {
 	localCtx, cancel := context.WithCancel(ctx)
@@ -223,7 +204,7 @@ func (t *PlayerTrack) IsPlaying() bool {
 }
 
 // Play starts playing audio from the URL
-func (t *PlayerTrack) Play(opts PlayerOptions, audioUtils AudioUtilsInterface) error {
+func (t *PlayerTrack) Play(opts PlayerOptions) error {
 	if t.IsPlaying() {
 		return ErrPlayerAlreadyPlaying
 	}
@@ -244,7 +225,7 @@ func (t *PlayerTrack) Play(opts PlayerOptions, audioUtils AudioUtilsInterface) e
 			case <-t.stopPlayingChan:
 				return
 			default:
-				if err := t.playOnce(opts, audioUtils); err != nil {
+				if err := t.playOnce(opts); err != nil {
 					if errors.Is(err, io.EOF) {
 						if opts.Loop {
 							t.log.Infof("player: reached EOF, looping...")
@@ -269,14 +250,13 @@ func (t *PlayerTrack) Play(opts PlayerOptions, audioUtils AudioUtilsInterface) e
 }
 
 // playOnce plays the audio file once
-func (t *PlayerTrack) playOnce(opts PlayerOptions, audioUtils AudioUtilsInterface) error {
-	file, err := audioUtils.GetFile(opts.URL, opts.Method, opts.Body)
+func (t *PlayerTrack) playOnce(opts PlayerOptions) error {
+	file, err := GetFile(opts.URL, opts.Method, opts.Body)
 	if err != nil {
 		return fmt.Errorf("failed to get file: %w", err)
 	}
-	defer file.Close()
 
-	oggReader, oggHeader, err := audioUtils.NewOggReader(file, opts.Loop)
+	oggReader, oggHeader, err := NewOggReader(file, opts.Loop)
 	if err != nil {
 		return fmt.Errorf("failed to create ogg reader: %w", err)
 	}
@@ -302,7 +282,7 @@ func (t *PlayerTrack) playOnce(opts PlayerOptions, audioUtils AudioUtilsInterfac
 			}
 
 			// Parse packet duration but don't store it as we don't need it
-			_, err = audioUtils.ParsePacketDuration(packet)
+			_, err = ParsePacketDuration(packet)
 			if err != nil {
 				return fmt.Errorf("failed to parse packet duration: %w", err)
 			}
@@ -348,46 +328,46 @@ func (t *PlayerTrack) Stop() {
 	}
 }
 
-// createLocalTrack creates a local track for the player
-func (t *PlayerTrack) createLocalTrack() *webrtc.TrackLocalStaticRTP {
-	track, err := webrtc.NewTrackLocalStaticRTP(
-		t.base.codec.RTPCodecCapability,
-		t.base.id,
-		t.base.streamid,
-	)
-	if err != nil {
-		panic(err)
-	}
-	return track
-}
+// // createLocalTrack creates a local track for the player
+// func (t *PlayerTrack) createLocalTrack() *webrtc.TrackLocalStaticRTP {
+// 	track, err := webrtc.NewTrackLocalStaticRTP(
+// 		t.base.codec.RTPCodecCapability,
+// 		t.base.id,
+// 		t.base.streamid,
+// 	)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// 	return track
+// }
 
-// subscribe allows a client to subscribe to this player track
-func (t *PlayerTrack) subscribe(c *Client) iClientTrack {
-	localTrack := t.createLocalTrack()
+// // subscribe allows a client to subscribe to this player track
+// func (t *PlayerTrack) subscribe(c *Client) iClientTrack {
+// 	localTrack := t.createLocalTrack()
 
-	ctx, cancel := context.WithCancel(t.Context())
+// 	ctx, cancel := context.WithCancel(t.Context())
 
-	ct := &clientTrack{
-		id:                    localTrack.ID(),
-		streamid:              localTrack.StreamID(),
-		context:               ctx,
-		mu:                    sync.RWMutex{},
-		client:                c,
-		kind:                  localTrack.Kind(),
-		mimeType:              localTrack.Codec().MimeType,
-		localTrack:            localTrack,
-		remoteTrack:           nil, // Player tracks don't have remote tracks
-		baseTrack:             t.base,
-		isScreen:              false,
-		ssrc:                  webrtc.SSRC(t.base.codec.PayloadType),
-		onTrackEndedCallbacks: make([]func(), 0),
-	}
+// 	ct := &clientTrack{
+// 		id:                    localTrack.ID(),
+// 		streamid:              localTrack.StreamID(),
+// 		context:               ctx,
+// 		mu:                    sync.RWMutex{},
+// 		client:                c,
+// 		kind:                  localTrack.Kind(),
+// 		mimeType:              localTrack.Codec().MimeType,
+// 		localTrack:            localTrack,
+// 		remoteTrack:           nil, // Player tracks don't have remote tracks
+// 		baseTrack:             t.base,
+// 		isScreen:              false,
+// 		ssrc:                  webrtc.SSRC(t.base.codec.PayloadType),
+// 		onTrackEndedCallbacks: make([]func(), 0),
+// 	}
 
-	t.OnEnded(func() {
-		ct.onEnded()
-		cancel()
-	})
+// 	t.OnEnded(func() {
+// 		ct.onEnded()
+// 		cancel()
+// 	})
 
-	t.base.clientTracks.Add(ct)
-	return ct
-}
+// 	t.base.clientTracks.Add(ct)
+// 	return ct
+// }

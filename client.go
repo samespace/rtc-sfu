@@ -1992,7 +1992,7 @@ func (c *Client) UnholdAllTracks() error {
 
 // Play plays audio from a URL to this client
 // This uses a single reusable player track to avoid renegotiation
-func (c *Client) Play(opts PlayerOptions, audioUtils AudioUtilsInterface) (*PlayerTrack, error) {
+func (c *Client) Play(opts PlayerOptions) (*PlayerTrack, error) {
 	c.playerMu.Lock()
 	defer c.playerMu.Unlock()
 
@@ -2011,7 +2011,7 @@ func (c *Client) Play(opts PlayerOptions, audioUtils AudioUtilsInterface) (*Play
 	}
 
 	// Start playing the new URL
-	if err := c.playerTrack.Play(opts, audioUtils); err != nil {
+	if err := c.playerTrack.Play(opts); err != nil {
 		return nil, fmt.Errorf("failed to start playing: %w", err)
 	}
 
