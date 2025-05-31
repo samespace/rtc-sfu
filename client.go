@@ -194,11 +194,10 @@ type Client struct {
 	vads                           map[uint32]*voiceactivedetector.VoiceDetector
 	log                            logging.LeveledLogger
 
-	// play state
-	playLock        sync.Mutex
-	playing         bool
-	playerOutTrack  *webrtc.TrackLocalStaticSample
-	stopPlayingChan chan struct{}
+	// player
+	playerTrack *webrtc.TrackLocalStaticSample
+	isPlaying   *atomic.Bool
+	playerStop  chan struct{}
 }
 
 func DefaultClientOptions() ClientOptions {
@@ -322,30 +321,7 @@ func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Confi
 		panic(err)
 	}
 
-	// Create a new Opus track for playback
-	playerTrackID := fmt.Sprintf("player-track-%s", uuid.New().String())
-	playerStreamID := fmt.Sprintf("player-stream-%s", uuid.New().String())
-	playerOutTrack, err := webrtc.NewTrackLocalStaticSample(
-		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus},
-		playerTrackID, playerStreamID,
-	)
-	if err == nil {
-		// Add track to peer connection, will trigger renegotiation
-		_, err = peerConnection.AddTrack(playerOutTrack)
-		if err != nil {
-			fmt.Println("error adding player track", err)
-		}
-	}
-	go func() {
-		for i := 0; i < 50; i++ {
-			// write silence to player track
-			silenceSample := media.Sample{Data: OpusSilenceFrame, Duration: time.Millisecond * 20}
-			err := playerOutTrack.WriteSample(silenceSample)
-			if err != nil {
-				fmt.Println("(player) error writing silence sample", err)
-			}
-		}
-	}()
+	playerTrack, _ := newPlayerTrack(peerConnection)
 
 	var stateNew atomic.Value
 	stateNew.Store(ClientStateNew)
@@ -385,10 +361,11 @@ func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Confi
 		vadInterceptor:                 vadInterceptor,
 		vads:                           vads,
 		log:                            opts.Log,
-		playLock:                       sync.Mutex{},
-		playing:                        false,
-		playerOutTrack:                 playerOutTrack,
-		stopPlayingChan:                make(chan struct{}),
+
+		// player
+		playerTrack: playerTrack,
+		isPlaying:   &atomic.Bool{},
+		playerStop:  make(chan struct{}, 1),
 	}
 
 	client.onTrack = func(track ITrack) {
@@ -1326,6 +1303,9 @@ func (c *Client) onLeft() {
 	c.muCallback.Lock()
 	defer c.muCallback.Unlock()
 
+	// stop playback
+	c.StopPlay()
+
 	for _, callback := range c.onLeftCallbacks {
 		go callback()
 	}
@@ -2024,45 +2004,38 @@ func (c *Client) UnholdAllTracks() error {
 	return firstError
 }
 
-// IsPlaying returns whether audio playback is ongoing.
-func (c *Client) IsPlaying() bool {
-	c.playLock.Lock()
-	defer c.playLock.Unlock()
-	return c.playing
-}
-
 // StopPlay stops any ongoing playback.
 func (c *Client) StopPlay() {
-	c.playLock.Lock()
-	defer c.playLock.Unlock()
-	if c.playing {
-		close(c.stopPlayingChan)
+	if c.isPlaying.Load() {
+		select {
+		case c.playerStop <- struct{}{}:
+		default:
+		}
+		c.isPlaying.Store(false)
 	}
 }
 
 // Play streams OGG Opus audio from the given endpoint to this client. It blocks until playback is stopped or completes.
 func (c *Client) Play(ctx context.Context, endpoint, method, body string, loop bool) error {
-	if c.IsPlaying() {
+	if c.isPlaying.Load() {
 		return errors.New("already playing")
 	}
-	// Mark playing and initialize stop channel
-	c.playLock.Lock()
-	c.playing = true
-	c.stopPlayingChan = make(chan struct{})
-	c.playLock.Unlock()
 
-	fmt.Println("client: playing", endpoint, method, body, loop)
+	playerTrack := c.playerTrack
+	if playerTrack == nil {
+		return errors.New("player track not found")
+	}
+	c.isPlaying.Store(true)
 
 	// Fetch and read OGG packets
 	file, err := GetFile(endpoint, method, body)
 	if err != nil {
 		return err
 	}
-	oggReader, oggHeader, err := NewOggReader(file, loop)
+	oggReader, _, err := NewOggReader(file, loop)
 	if err != nil {
 		return err
 	}
-	c.log.Infof("client: OGG Header details - Channels: %d, SampleRate: %d", oggHeader.Channels, oggHeader.SampleRate)
 
 	// Playback ticker
 	ticker := time.NewTicker(time.Millisecond * 20)
@@ -2070,12 +2043,8 @@ func (c *Client) Play(ctx context.Context, endpoint, method, body string, loop b
 
 	for {
 		select {
-		case <-c.stopPlayingChan:
-			fmt.Println("client: stopping playback")
-			c.log.Infof("client: stopping playback")
-			c.playLock.Lock()
-			c.playing = false
-			c.playLock.Unlock()
+		case <-c.playerStop:
+			c.isPlaying.Store(false)
 			return nil
 
 		case <-ticker.C:
@@ -2092,10 +2061,7 @@ func (c *Client) Play(ctx context.Context, endpoint, method, body string, loop b
 					}
 					continue
 				}
-				// Playback complete
-				c.playLock.Lock()
-				c.playing = false
-				c.playLock.Unlock()
+				c.isPlaying.Store(false)
 				return nil
 			}
 			if err != nil {
@@ -2107,10 +2073,37 @@ func (c *Client) Play(ctx context.Context, endpoint, method, body string, loop b
 			if err != nil {
 				return err
 			}
-			fmt.Println("client: writing sample", dur)
-			if err := c.playerOutTrack.WriteSample(media.Sample{Data: packet, Duration: dur}); err != nil {
+			if err := playerTrack.WriteSample(media.Sample{Data: packet, Duration: dur}); err != nil {
 				return err
 			}
 		}
 	}
+}
+
+func newPlayerTrack(peerConnection *webrtc.PeerConnection) (*webrtc.TrackLocalStaticSample, error) {
+	trackID := fmt.Sprintf("player-track-%s", uuid.New().String())
+	streamID := fmt.Sprintf("player-stream-%s", uuid.New().String())
+	track, err := webrtc.NewTrackLocalStaticSample(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus},
+		trackID, streamID,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Add track to peer connection, will trigger renegotiation
+	_, err = peerConnection.AddTrack(track)
+	if err != nil {
+		fmt.Println("error adding player track", err)
+	}
+
+	// write silence to player track
+	go func() {
+		for i := 0; i < 50; i++ {
+			silenceSample := media.Sample{Data: OpusSilenceFrame, Duration: time.Millisecond * 20}
+			track.WriteSample(silenceSample)
+		}
+	}()
+
+	return track, nil
 }
