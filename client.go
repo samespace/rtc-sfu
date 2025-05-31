@@ -2029,7 +2029,7 @@ func (c *Client) createPlayerTrack() error {
 		Channels:   1,
 	}
 
-	c.playerTrack = newPlayerTrack(c.context, c, defaultOpts, nil)
+	c.playerTrack = newPlayerTrack(c.context, c, defaultOpts)
 
 	// Add the track to the client's published tracks
 	if err := c.publishedTracks.Add(c.playerTrack); err != nil {

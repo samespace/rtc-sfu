@@ -67,7 +67,7 @@ type OggHeader struct {
 }
 
 // newPlayerTrack creates a new player track
-func newPlayerTrack(ctx context.Context, client *Client, opts PlayerOptions, audioUtils AudioUtilsInterface) *PlayerTrack {
+func newPlayerTrack(ctx context.Context, client *Client, opts PlayerOptions) *PlayerTrack {
 	if opts.TrackID == "" {
 		opts.TrackID = uuid.New().String()
 	}
