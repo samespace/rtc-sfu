@@ -328,46 +328,46 @@ func (t *PlayerTrack) Stop() {
 	}
 }
 
-// // createLocalTrack creates a local track for the player
-// func (t *PlayerTrack) createLocalTrack() *webrtc.TrackLocalStaticRTP {
-// 	track, err := webrtc.NewTrackLocalStaticRTP(
-// 		t.base.codec.RTPCodecCapability,
-// 		t.base.id,
-// 		t.base.streamid,
-// 	)
-// 	if err != nil {
-// 		panic(err)
-// 	}
-// 	return track
-// }
+// createLocalTrack creates a local track for the player
+func (t *PlayerTrack) createLocalTrack() *webrtc.TrackLocalStaticRTP {
+	track, err := webrtc.NewTrackLocalStaticRTP(
+		t.base.codec.RTPCodecCapability,
+		t.base.id,
+		t.base.streamid,
+	)
+	if err != nil {
+		panic(err)
+	}
+	return track
+}
 
-// // subscribe allows a client to subscribe to this player track
-// func (t *PlayerTrack) subscribe(c *Client) iClientTrack {
-// 	localTrack := t.createLocalTrack()
+// subscribe allows a client to subscribe to this player track
+func (t *PlayerTrack) subscribe(c *Client) iClientTrack {
+	localTrack := t.createLocalTrack()
 
-// 	ctx, cancel := context.WithCancel(t.Context())
+	ctx, cancel := context.WithCancel(t.Context())
 
-// 	ct := &clientTrack{
-// 		id:                    localTrack.ID(),
-// 		streamid:              localTrack.StreamID(),
-// 		context:               ctx,
-// 		mu:                    sync.RWMutex{},
-// 		client:                c,
-// 		kind:                  localTrack.Kind(),
-// 		mimeType:              localTrack.Codec().MimeType,
-// 		localTrack:            localTrack,
-// 		remoteTrack:           nil, // Player tracks don't have remote tracks
-// 		baseTrack:             t.base,
-// 		isScreen:              false,
-// 		ssrc:                  webrtc.SSRC(t.base.codec.PayloadType),
-// 		onTrackEndedCallbacks: make([]func(), 0),
-// 	}
+	ct := &clientTrack{
+		id:                    localTrack.ID(),
+		streamid:              localTrack.StreamID(),
+		context:               ctx,
+		mu:                    sync.RWMutex{},
+		client:                c,
+		kind:                  localTrack.Kind(),
+		mimeType:              localTrack.Codec().MimeType,
+		localTrack:            localTrack,
+		remoteTrack:           nil, // Player tracks don't have remote tracks
+		baseTrack:             t.base,
+		isScreen:              false,
+		ssrc:                  webrtc.SSRC(t.base.codec.PayloadType),
+		onTrackEndedCallbacks: make([]func(), 0),
+	}
 
-// 	t.OnEnded(func() {
-// 		ct.onEnded()
-// 		cancel()
-// 	})
+	t.OnEnded(func() {
+		ct.onEnded()
+		cancel()
+	})
 
-// 	t.base.clientTracks.Add(ct)
-// 	return ct
-// }
+	t.base.clientTracks.Add(ct)
+	return ct
+}

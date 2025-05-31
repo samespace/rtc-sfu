@@ -996,7 +996,6 @@ func (c *Client) setClientTrack(t ITrack) iClientTrack {
 	if t.IsSimulcast() {
 		simulcastTrack := t.(*SimulcastTrack)
 		outputTrack = simulcastTrack.subscribe(c)
-
 	} else {
 		if t.Kind() == webrtc.RTPCodecTypeAudio {
 			singleTrack := t.(*AudioTrack)
@@ -1005,7 +1004,6 @@ func (c *Client) setClientTrack(t ITrack) iClientTrack {
 			singleTrack := t.(*Track)
 			outputTrack = singleTrack.subscribe(c)
 		}
-
 	}
 
 	localTrack := outputTrack.LocalTrack()
@@ -2028,16 +2026,58 @@ func (c *Client) createPlayerTrack() error {
 	c.playerTrack.SetAsProcessed()
 	c.playerTrack.SetSourceType(TrackTypeMedia)
 
-	// Add the track to the client's tracks (this is important for SFU track management)
+	// Add the track to the client's tracks (for SFU track management)
 	if err := c.tracks.Add(c.playerTrack); err != nil {
 		return fmt.Errorf("failed to add player track to client tracks: %w", err)
 	}
 
-	// Trigger the onTrack callback to integrate with SFU's track management
-	// This ensures the track is properly handled like any other track
-	if c.onTrack != nil {
-		c.onTrack(c.playerTrack)
+	// Subscribe this client to its own player track
+	clientTrack := c.playerTrack.subscribe(c)
+	if clientTrack == nil {
+		return fmt.Errorf("failed to subscribe to player track")
 	}
+
+	// Add to published tracks so it can be discovered by other clients
+	if err := c.publishedTracks.Add(c.playerTrack); err != nil {
+		return fmt.Errorf("failed to add player track to published tracks: %w", err)
+	}
+
+	// Create the WebRTC transceiver for the player track
+	localTrack := clientTrack.LocalTrack()
+	senderTcv, err := c.peerConnection.PC().AddTransceiverFromTrack(localTrack, webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendonly})
+	if err != nil {
+		return fmt.Errorf("failed to add player track transceiver: %w", err)
+	}
+
+	// Store the sender for hold/unhold functionality
+	c.peerConnection.StoreSender(clientTrack.ID(), senderTcv.Sender(), localTrack)
+
+	// Set up track ended callback
+	clientTrack.OnEnded(func() {
+		if c == nil {
+			return
+		}
+
+		defer func() {
+			c.muTracks.Lock()
+			delete(c.clientTracks, clientTrack.ID())
+			c.publishedTracks.remove([]string{clientTrack.ID()})
+			c.muTracks.Unlock()
+		}()
+
+		sender := senderTcv.Sender()
+		if sender != nil {
+			c.peerConnection.PC().RemoveTrack(sender)
+		}
+	})
+
+	// Enable RTCP report and stats
+	c.enableReportAndStats(senderTcv.Sender(), clientTrack)
+
+	// Add to client tracks
+	c.muTracks.Lock()
+	c.clientTracks[clientTrack.ID()] = clientTrack
+	c.muTracks.Unlock()
 
 	c.log.Infof("client: created reusable player track for %s", c.ID())
 	return nil
