@@ -197,7 +197,7 @@ type Client struct {
 	// player
 	playerTrack *webrtc.TrackLocalStaticSample
 	isPlaying   *atomic.Bool
-	playerStop  chan struct{}
+	playerStop  chan bool
 }
 
 func DefaultClientOptions() ClientOptions {
@@ -365,7 +365,7 @@ func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Confi
 		// player
 		playerTrack: playerTrack,
 		isPlaying:   &atomic.Bool{},
-		playerStop:  make(chan struct{}),
+		playerStop:  make(chan bool),
 	}
 
 	client.onTrack = func(track ITrack) {
@@ -2008,11 +2008,10 @@ func (c *Client) UnholdAllTracks() error {
 func (c *Client) StopPlay() {
 	fmt.Println("client: stop play called")
 	if c.isPlaying.Load() {
-		// signal Play loop to stop
-		c.playerStop <- struct{}{}
+		fmt.Println("client: stop play called 2")
+		c.playerStop <- true
+		fmt.Println("client: stop play called 3")
 	}
-	// Mark as not playing
-	c.isPlaying.Store(false)
 }
 
 // Play streams OGG Opus audio from the given endpoint to this client. It blocks until playback is stopped or completes.
