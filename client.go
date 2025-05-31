@@ -639,7 +639,7 @@ func (c *Client) Context() context.Context {
 
 // OnTrackAdded event is to confirmed the source type of the pending published tracks.
 // If the event is not listened, the pending published tracks will be ignored and not published to other clients.
-// Once received, respond with `client.SetTracksSourceType()“ to confirm the source type of the pending published tracks
+// Once received, respond with `client.SetTracksSourceType()" to confirm the source type of the pending published tracks
 func (c *Client) OnTracksAdded(callback func(addedTracks []ITrack)) {
 	c.muCallback.Lock()
 	defer c.muCallback.Unlock()
@@ -1013,7 +1013,8 @@ func (c *Client) setClientTrack(t ITrack) iClientTrack {
 		return nil
 	}
 
-	// TODO: change to non goroutine
+	// Store the sender for hold/unhold functionality
+	c.peerConnection.StoreSender(outputTrack.ID(), senderTcv.Sender(), localTrack)
 
 	outputTrack.OnEnded(func() {
 		if c == nil {
@@ -1928,4 +1929,60 @@ func (c *Client) onNetworkConditionChanged(condition networkmonitor.NetworkCondi
 	if c.onNetworkConditionChangedFunc != nil {
 		c.onNetworkConditionChangedFunc(condition)
 	}
+}
+
+// Hold puts a specific track on hold by replacing it with a silence track.
+// This effectively mutes the track for the receiving peer.
+// The trackID should be the ID of the track to put on hold.
+func (c *Client) Hold(trackID string) error {
+	sender, exists := c.peerConnection.GetSender(trackID)
+	if !exists {
+		return ErrTrackIsNotExists
+	}
+
+	return c.peerConnection.Hold(trackID, sender)
+}
+
+// Unhold removes a track from hold by restoring the original track.
+// The trackID should be the ID of the track to remove from hold.
+func (c *Client) Unhold(trackID string) error {
+	return c.peerConnection.Unhold(trackID)
+}
+
+// IsTrackOnHold checks if a specific track is currently on hold.
+func (c *Client) IsTrackOnHold(trackID string) bool {
+	return c.peerConnection.IsOnHold(trackID)
+}
+
+// GetHeldTracks returns a list of track IDs that are currently on hold.
+func (c *Client) GetHeldTracks() []string {
+	return c.peerConnection.GetHeldTracks()
+}
+
+// HoldAllTracks puts all tracks from this client on hold.
+// This is useful for muting the entire client.
+func (c *Client) HoldAllTracks() error {
+	c.muTracks.Lock()
+	defer c.muTracks.Unlock()
+
+	var firstError error
+	for trackID := range c.clientTracks {
+		if err := c.Hold(trackID); err != nil && firstError == nil {
+			firstError = err
+		}
+	}
+	return firstError
+}
+
+// UnholdAllTracks removes all tracks from hold.
+// This is useful for unmuting the entire client.
+func (c *Client) UnholdAllTracks() error {
+	heldTracks := c.GetHeldTracks()
+	var firstError error
+	for _, trackID := range heldTracks {
+		if err := c.Unhold(trackID); err != nil && firstError == nil {
+			firstError = err
+		}
+	}
+	return firstError
 }
