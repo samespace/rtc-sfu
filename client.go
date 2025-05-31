@@ -325,14 +325,13 @@ func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Confi
 	// Create a new Opus track for playback
 	playerTrackID := fmt.Sprintf("player-track-%s", uuid.New().String())
 	playerStreamID := fmt.Sprintf("player-stream-%s", uuid.New().String())
-	track, err := webrtc.NewTrackLocalStaticSample(
+	playerOutTrack, err := webrtc.NewTrackLocalStaticSample(
 		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus},
 		playerTrackID, playerStreamID,
 	)
 	if err == nil {
-		client.playerOutTrack = track
 		// Add track to peer connection, will trigger renegotiation
-		_, err = peerConnection.AddTrack(track)
+		_, err = peerConnection.AddTrack(playerOutTrack)
 		if err != nil {
 			fmt.Println("error adding player track", err)
 		}
@@ -378,7 +377,7 @@ func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Confi
 		log:                            opts.Log,
 		playLock:                       sync.Mutex{},
 		playing:                        false,
-		playerOutTrack:                 nil,
+		playerOutTrack:                 playerOutTrack,
 		stopPlayingChan:                make(chan struct{}),
 	}
 
