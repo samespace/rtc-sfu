@@ -2005,8 +2005,11 @@ func (c *Client) UnholdAllTracks() error {
 
 // StopPlay stops any ongoing playback.
 func (c *Client) StopPlay() {
+	fmt.Println("client: stop play called")
 	if c.isPlaying.Load() && c.playerStop != nil {
+		fmt.Println("client: stop play called 2")
 		close(c.playerStop)
+		fmt.Println("client: stop play called 3")
 	}
 }
 
