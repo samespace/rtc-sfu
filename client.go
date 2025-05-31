@@ -191,9 +191,9 @@ type Client struct {
 	vadInterceptor                 *voiceactivedetector.Interceptor
 	vads                           map[uint32]*voiceactivedetector.VoiceDetector
 	log                            logging.LeveledLogger
-	// Player track - single reusable track for all URL playback
-	playerTrack *PlayerTrack
-	playerMu    sync.Mutex
+	// URL track - reusable URL audio playback
+	urlTrack   *URLTrack
+	urlTrackMu sync.Mutex
 }
 
 func DefaultClientOptions() ClientOptions {
@@ -611,6 +611,12 @@ func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Confi
 		client.renegotiate(false)
 	})
 
+	// Setup URL audio playback track alongside other client tracks
+	client.urlTrack = NewURLTrack(client.context, client)
+	client.urlTrack.SetAsProcessed()
+	client.urlTrack.SetSourceType(TrackTypeMedia)
+	// Allow other clients to discover this track removed: subscription now via setClientTrack
+
 	return client
 }
 
@@ -993,7 +999,10 @@ func (c *Client) setClientTrack(t ITrack) iClientTrack {
 		return nil
 	}
 
-	if t.IsSimulcast() {
+	// Handle URLTrack subscription specially
+	if ut, ok := t.(*URLTrack); ok {
+		outputTrack = ut.subscribe(c)
+	} else if t.IsSimulcast() {
 		simulcastTrack := t.(*SimulcastTrack)
 		outputTrack = simulcastTrack.subscribe(c)
 	} else {
@@ -1988,122 +1997,31 @@ func (c *Client) UnholdAllTracks() error {
 	return firstError
 }
 
-// Play plays audio from a URL to this client
-// This uses a single reusable player track to avoid renegotiation
-func (c *Client) Play(opts PlayerOptions) (*PlayerTrack, error) {
-	c.playerMu.Lock()
-	defer c.playerMu.Unlock()
-
-	// Create player track if it doesn't exist
-	if c.playerTrack == nil {
-		if err := c.createPlayerTrack(); err != nil {
-			return nil, fmt.Errorf("failed to create player track: %w", err)
-		}
+// Play starts URL audio playback for this client
+func (c *Client) Play(opts URLTrackOptions) (*URLTrack, error) {
+	c.urlTrackMu.Lock()
+	defer c.urlTrackMu.Unlock()
+	if c.urlTrack == nil {
+		return nil, fmt.Errorf("url track not initialized")
 	}
-
-	// If already playing, stop first
-	if c.playerTrack.IsPlaying() {
-		c.playerTrack.Stop()
-		// Wait a bit for the previous playback to stop
-		time.Sleep(100 * time.Millisecond)
+	if err := c.urlTrack.Play(opts); err != nil {
+		return nil, err
 	}
-
-	// Start playing the new URL
-	if err := c.playerTrack.Play(opts); err != nil {
-		return nil, fmt.Errorf("failed to start playing: %w", err)
-	}
-
-	c.log.Infof("client: started playback for %s from %s", c.ID(), opts.URL)
-	return c.playerTrack, nil
+	return c.urlTrack, nil
 }
 
-// createPlayerTrack creates the single reusable player track for this client
-func (c *Client) createPlayerTrack() error {
-	// Create player track
-	c.playerTrack = newPlayerTrack(c.context, c)
-
-	// Set the track as processed and set source type
-	c.playerTrack.SetAsProcessed()
-	c.playerTrack.SetSourceType(TrackTypeMedia)
-
-	// Add the track to the client's tracks (for SFU track management)
-	if err := c.tracks.Add(c.playerTrack); err != nil {
-		return fmt.Errorf("failed to add player track to client tracks: %w", err)
+// StopPlay stops URL audio playback
+func (c *Client) StopPlay() {
+	c.urlTrackMu.Lock()
+	defer c.urlTrackMu.Unlock()
+	if c.urlTrack != nil {
+		c.urlTrack.Stop()
 	}
-
-	// Subscribe this client to its own player track
-	clientTrack := c.playerTrack.subscribe(c)
-	if clientTrack == nil {
-		return fmt.Errorf("failed to subscribe to player track")
-	}
-
-	// Add to published tracks so it can be discovered by other clients
-	if err := c.publishedTracks.Add(c.playerTrack); err != nil {
-		return fmt.Errorf("failed to add player track to published tracks: %w", err)
-	}
-
-	// Create the WebRTC transceiver for the player track
-	localTrack := clientTrack.LocalTrack()
-	senderTcv, err := c.peerConnection.PC().AddTransceiverFromTrack(localTrack, webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendonly})
-	if err != nil {
-		return fmt.Errorf("failed to add player track transceiver: %w", err)
-	}
-
-	// Store the sender for hold/unhold functionality
-	c.peerConnection.StoreSender(clientTrack.ID(), senderTcv.Sender(), localTrack)
-
-	// Set up track ended callback
-	clientTrack.OnEnded(func() {
-		if c == nil {
-			return
-		}
-
-		defer func() {
-			c.muTracks.Lock()
-			delete(c.clientTracks, clientTrack.ID())
-			c.publishedTracks.remove([]string{clientTrack.ID()})
-			c.muTracks.Unlock()
-		}()
-
-		sender := senderTcv.Sender()
-		if sender != nil {
-			c.peerConnection.PC().RemoveTrack(sender)
-		}
-	})
-
-	// Enable RTCP report and stats
-	c.enableReportAndStats(senderTcv.Sender(), clientTrack)
-
-	// Add to client tracks
-	c.muTracks.Lock()
-	c.clientTracks[clientTrack.ID()] = clientTrack
-	c.muTracks.Unlock()
-
-	c.log.Infof("client: created reusable player track for %s", c.ID())
-	return nil
 }
 
-// StopPlay stops playback for this client
-func (c *Client) StopPlay() error {
-	c.playerMu.Lock()
-	defer c.playerMu.Unlock()
-
-	if c.playerTrack == nil {
-		return nil // No player track exists
-	}
-
-	if c.playerTrack.IsPlaying() {
-		c.playerTrack.Stop()
-		c.log.Infof("client: stopped playback for %s", c.ID())
-	}
-
-	return nil
-}
-
-// IsPlaying returns true if this client has active playback
+// IsPlaying reports if URL audio is currently playing for this client
 func (c *Client) IsPlaying() bool {
-	c.playerMu.Lock()
-	defer c.playerMu.Unlock()
-
-	return c.playerTrack != nil && c.playerTrack.IsPlaying()
+	c.urlTrackMu.Lock()
+	defer c.urlTrackMu.Unlock()
+	return c.urlTrack != nil && c.urlTrack.IsPlaying()
 }
