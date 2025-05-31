@@ -2006,13 +2006,16 @@ func (c *Client) UnholdAllTracks() error {
 
 // StopPlay stops any ongoing playback.
 func (c *Client) StopPlay() {
+	fmt.Println("client: stop play called")
 	if c.isPlaying.Load() {
+		fmt.Println("client: stop play called 2")
 		select {
 		case c.playerStop <- struct{}{}:
 		default:
 		}
 		c.isPlaying.Store(false)
 	}
+	fmt.Println("client: stop play called 3")
 }
 
 // Play streams OGG Opus audio from the given endpoint to this client. It blocks until playback is stopped or completes.
