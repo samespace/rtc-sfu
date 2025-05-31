@@ -418,6 +418,9 @@ func (r *Room) StopRecording() error {
 
 // mergeAndUpload mixes per-channel recordings, merges stereo, uploads to S3, and removes local files.
 func (r *Room) mergeAndUpload(session *recordingSession) error {
+
+	fmt.Printf("merging and uploading: %s", session.id)
+
 	baseDir := filepath.Join(session.cfg.BasePath, session.id)
 	// Group track files by channel
 	filesByChannel := map[ChannelType][]string{}
