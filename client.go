@@ -2045,6 +2045,7 @@ func (c *Client) Play(ctx context.Context, endpoint, method, body string, loop b
 		select {
 		case <-c.playerStop:
 			c.isPlaying.Store(false)
+			fmt.Println("client: stopping playback")
 			return nil
 
 		case <-ticker.C:
