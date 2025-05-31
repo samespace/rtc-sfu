@@ -191,6 +191,9 @@ type Client struct {
 	vadInterceptor                 *voiceactivedetector.Interceptor
 	vads                           map[uint32]*voiceactivedetector.VoiceDetector
 	log                            logging.LeveledLogger
+	// Player track - single reusable track for all URL playback
+	playerTrack *PlayerTrack
+	playerMu    sync.Mutex
 }
 
 func DefaultClientOptions() ClientOptions {
@@ -1985,4 +1988,89 @@ func (c *Client) UnholdAllTracks() error {
 		}
 	}
 	return firstError
+}
+
+// Play plays audio from a URL to this client
+// This uses a single reusable player track to avoid renegotiation
+func (c *Client) Play(opts PlayerOptions, audioUtils AudioUtilsInterface) (*PlayerTrack, error) {
+	c.playerMu.Lock()
+	defer c.playerMu.Unlock()
+
+	// Create player track if it doesn't exist
+	if c.playerTrack == nil {
+		if err := c.createPlayerTrack(); err != nil {
+			return nil, fmt.Errorf("failed to create player track: %w", err)
+		}
+	}
+
+	// If already playing, stop first
+	if c.playerTrack.IsPlaying() {
+		c.playerTrack.Stop()
+		// Wait a bit for the previous playback to stop
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Start playing the new URL
+	if err := c.playerTrack.Play(opts, audioUtils); err != nil {
+		return nil, fmt.Errorf("failed to start playing: %w", err)
+	}
+
+	c.log.Infof("client: started playback for %s from %s", c.ID(), opts.URL)
+	return c.playerTrack, nil
+}
+
+// createPlayerTrack creates the single reusable player track for this client
+func (c *Client) createPlayerTrack() error {
+	// Create player track with default settings
+	defaultOpts := PlayerOptions{
+		TrackID:    fmt.Sprintf("player-%s", c.ID()),
+		StreamID:   fmt.Sprintf("player-stream-%s", c.ID()),
+		SampleRate: 48000,
+		Channels:   1,
+	}
+
+	c.playerTrack = newPlayerTrack(c.context, c, defaultOpts, nil)
+
+	// Add the track to the client's published tracks
+	if err := c.publishedTracks.Add(c.playerTrack); err != nil {
+		return fmt.Errorf("failed to add player track: %w", err)
+	}
+
+	// Set the track as processed and set source type
+	c.playerTrack.SetAsProcessed()
+	c.playerTrack.SetSourceType(TrackTypeMedia)
+
+	// Subscribe this client to the player track
+	clientTrack := c.setClientTrack(c.playerTrack)
+	if clientTrack == nil {
+		return fmt.Errorf("failed to subscribe to player track")
+	}
+
+	c.log.Infof("client: created reusable player track for %s", c.ID())
+	return nil
+}
+
+// StopPlay stops playback for this client
+func (c *Client) StopPlay() error {
+	c.playerMu.Lock()
+	defer c.playerMu.Unlock()
+
+	if c.playerTrack == nil {
+		return nil // No player track exists
+	}
+
+	if c.playerTrack.IsPlaying() {
+		c.playerTrack.Stop()
+		c.log.Infof("client: stopped playback for %s", c.ID())
+	}
+
+	return nil
+}
+
+// IsPlaying returns true if this client has active playback
+func (c *Client) IsPlaying() bool {
+	c.playerMu.Lock()
+	defer c.playerMu.Unlock()
+
+	return c.playerTrack != nil && c.playerTrack.IsPlaying()
 }
