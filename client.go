@@ -2030,6 +2030,15 @@ func (c *Client) Play(ctx context.Context, endpoint, method, body string, loop b
 	}
 	c.isPlaying.Store(true)
 
+	// Playback ticker
+	ticker := time.NewTicker(time.Millisecond * 20)
+	defer func() {
+		fmt.Println("client: stopping play")
+		c.playerStop = nil
+		c.isPlaying.Store(false)
+		ticker.Stop()
+	}()
+
 	// Fetch and read OGG packets
 	file, err := GetFile(endpoint, method, body)
 	if err != nil {
@@ -2040,14 +2049,9 @@ func (c *Client) Play(ctx context.Context, endpoint, method, body string, loop b
 		return err
 	}
 
-	// Playback ticker
-	ticker := time.NewTicker(time.Millisecond * 20)
-	defer func() {
-		fmt.Println("client: stopping play")
-		c.playerStop = nil
-		c.isPlaying.Store(false)
-		ticker.Stop()
-	}()
+	fmt.Println("client: playing")
+	fmt.Println("player stop", c.playerStop)
+	fmt.Println("is playing", c.isPlaying.Load())
 
 	for {
 		select {
