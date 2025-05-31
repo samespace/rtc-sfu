@@ -365,7 +365,7 @@ func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Confi
 		// player
 		playerTrack: playerTrack,
 		isPlaying:   &atomic.Bool{},
-		playerStop:  make(chan struct{}, 1),
+		playerStop:  make(chan struct{}),
 	}
 
 	client.onTrack = func(track ITrack) {
@@ -1185,6 +1185,9 @@ func (c *Client) afterClosed() {
 	c.sfu.onAfterClientStopped(c)
 
 	c.cancel()
+
+	// close player stop chan
+	close(c.playerStop)
 }
 
 func (c *Client) stop() error {
@@ -1302,9 +1305,6 @@ func (c *Client) OnLeft(callback func()) {
 func (c *Client) onLeft() {
 	c.muCallback.Lock()
 	defer c.muCallback.Unlock()
-
-	// stop playback
-	go c.StopPlay()
 
 	for _, callback := range c.onLeftCallbacks {
 		go callback()
