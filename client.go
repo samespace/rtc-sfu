@@ -1996,6 +1996,7 @@ func (c *Client) Play(opts URLTrackOptions) (*URLTrack, error) {
 	c.urlTrackMu.Lock()
 	defer c.urlTrackMu.Unlock()
 	if c.urlTrack == nil {
+		fmt.Println("client: play, creating url track")
 
 		// Setup URL audio playback track alongside other client tracks
 		urlTrack := NewURLTrack(c.context, c)

@@ -183,9 +183,9 @@ func (t *URLTrack) Play(opts URLTrackOptions) error {
 		return errors.New("already playing")
 	}
 	t.isPlaying.Store(true)
-	t.log.Infof("urltrack: start %s loop=%v", opts.URL, opts.Loop)
+	fmt.Println("urltrack: start", opts.URL, opts.Loop)
 	go func() {
-		defer func() { t.isPlaying.Store(false); t.log.Infof("urltrack: stopped") }()
+		defer func() { t.isPlaying.Store(false) }()
 		for {
 			select {
 			case <-t.context.Done():
