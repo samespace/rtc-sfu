@@ -9,7 +9,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/inlivedev/sfu/pkg/rtppool"
 	"github.com/pion/interceptor"
 	"github.com/pion/logging"
@@ -37,14 +36,10 @@ type PlayerTrack struct {
 
 // PlayerOptions contains configuration for URL playback
 type PlayerOptions struct {
-	URL        string
-	Method     string // HTTP method for fetching the URL
-	Body       string // Request body if needed
-	Loop       bool   // Whether to loop the audio
-	TrackID    string // Optional custom track ID
-	StreamID   string // Optional custom stream ID
-	SampleRate uint32 // Audio sample rate (default: 48000)
-	Channels   uint16 // Audio channels (default: 1)
+	URL    string
+	Method string // HTTP method for fetching the URL
+	Body   string // Request body if needed
+	Loop   bool   // Whether to loop the audio
 }
 
 // AudioUtilsInterface defines the interface for audio utilities
@@ -67,27 +62,14 @@ type OggHeader struct {
 }
 
 // newPlayerTrack creates a new player track
-func newPlayerTrack(ctx context.Context, client *Client, opts PlayerOptions) *PlayerTrack {
-	if opts.TrackID == "" {
-		opts.TrackID = uuid.New().String()
-	}
-	if opts.StreamID == "" {
-		opts.StreamID = "player"
-	}
-	if opts.SampleRate == 0 {
-		opts.SampleRate = 48000
-	}
-	if opts.Channels == 0 {
-		opts.Channels = 1
-	}
-
+func newPlayerTrack(ctx context.Context, client *Client) *PlayerTrack {
 	localCtx, cancel := context.WithCancel(ctx)
 
 	codec := webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{
 			MimeType:     webrtc.MimeTypeOpus,
-			ClockRate:    opts.SampleRate,
-			Channels:     opts.Channels,
+			ClockRate:    48000,
+			Channels:     1,
 			SDPFmtpLine:  "minptime=10;useinbandfec=1",
 			RTCPFeedback: []webrtc.RTCPFeedback{},
 		},
@@ -95,9 +77,9 @@ func newPlayerTrack(ctx context.Context, client *Client, opts PlayerOptions) *Pl
 	}
 
 	baseTrack := &baseTrack{
-		id:           opts.TrackID,
-		msid:         opts.StreamID + " " + opts.TrackID,
-		streamid:     opts.StreamID,
+		id:           fmt.Sprintf("player-%s", client.ID()),
+		msid:         fmt.Sprintf("player-stream-%s", client.ID()) + " " + fmt.Sprintf("player-%s", client.ID()),
+		streamid:     fmt.Sprintf("player-stream-%s", client.ID()),
 		client:       client,
 		kind:         webrtc.RTPCodecTypeAudio,
 		codec:        codec,

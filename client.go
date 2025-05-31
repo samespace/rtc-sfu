@@ -2021,29 +2021,22 @@ func (c *Client) Play(opts PlayerOptions, audioUtils AudioUtilsInterface) (*Play
 
 // createPlayerTrack creates the single reusable player track for this client
 func (c *Client) createPlayerTrack() error {
-	// Create player track with default settings
-	defaultOpts := PlayerOptions{
-		TrackID:    fmt.Sprintf("player-%s", c.ID()),
-		StreamID:   fmt.Sprintf("player-stream-%s", c.ID()),
-		SampleRate: 48000,
-		Channels:   1,
-	}
-
-	c.playerTrack = newPlayerTrack(c.context, c, defaultOpts)
-
-	// Add the track to the client's published tracks
-	if err := c.publishedTracks.Add(c.playerTrack); err != nil {
-		return fmt.Errorf("failed to add player track: %w", err)
-	}
+	// Create player track
+	c.playerTrack = newPlayerTrack(c.context, c)
 
 	// Set the track as processed and set source type
 	c.playerTrack.SetAsProcessed()
 	c.playerTrack.SetSourceType(TrackTypeMedia)
 
-	// Subscribe this client to the player track
-	clientTrack := c.setClientTrack(c.playerTrack)
-	if clientTrack == nil {
-		return fmt.Errorf("failed to subscribe to player track")
+	// Add the track to the client's tracks (this is important for SFU track management)
+	if err := c.tracks.Add(c.playerTrack); err != nil {
+		return fmt.Errorf("failed to add player track to client tracks: %w", err)
+	}
+
+	// Trigger the onTrack callback to integrate with SFU's track management
+	// This ensures the track is properly handled like any other track
+	if c.onTrack != nil {
+		c.onTrack(c.playerTrack)
 	}
 
 	c.log.Infof("client: created reusable player track for %s", c.ID())
