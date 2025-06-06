@@ -892,20 +892,8 @@ func (c *Client) setOpusSDP(sdp webrtc.SessionDescription) webrtc.SessionDescrip
 			return sdp
 		}
 
-		var newFmtpLine = ""
-
-		if strings.Contains(fmtpLine, "usedtx=1") {
-			newFmtpLine += ";usedtx=0"
-		}
-
-		if strings.Contains(fmtpLine, "useinbandfec=1") {
-			newFmtpLine += ";useinbandfec=0"
-		}
-
-		if newFmtpLine != "" {
-			sdp.SDP = strings.Replace(sdp.SDP, fmtpLine, fmtpLine+newFmtpLine, -1)
-		}
-
+		var newFmtpLine = ";usedtx=0;useinbandfec=0"
+		sdp.SDP = strings.Replace(sdp.SDP, fmtpLine, fmtpLine+newFmtpLine, -1)
 	}
 
 	if !c.dataChannelsInitiated {
