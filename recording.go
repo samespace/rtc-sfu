@@ -169,6 +169,8 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 			tw.mu.Lock()
 			defer tw.mu.Unlock()
 
+			fmt.Printf("writing packet for client %s, track %s: %v", clientID, track.ID(), pkt)
+
 			// // Current time when packet arrived
 			// currentPacketTime := time.Now()
 
