@@ -855,6 +855,57 @@ func (c *Client) setOpusSDP(sdp webrtc.SessionDescription) webrtc.SessionDescrip
 		if newFmtpLine != "" {
 			sdp.SDP = strings.Replace(sdp.SDP, fmtpLine, fmtpLine+newFmtpLine, -1)
 		}
+	} else {
+		// remove the opus usedtx line
+		regex, err := regexp.Compile(`a=rtpmap:(\d+) opus\/(\d+)\/(\d+)`)
+		if err != nil {
+			c.log.Errorf("client: error on compile regex ", err)
+			return sdp
+		}
+		var opusLine = regex.FindString(sdp.SDP)
+		if opusLine == "" {
+			c.log.Errorf("client: error opus line not found")
+			return sdp
+		}
+
+		regex, err = regexp.Compile(`(\d+)`)
+		if err != nil {
+			c.log.Errorf("client: error on compile regex ", err)
+			return sdp
+		}
+
+		var opusNo = regex.FindString(opusLine)
+		if opusNo == "" {
+			c.log.Errorf("client: error opus no not found")
+			return sdp
+		}
+
+		fmtpRegex, err := regexp.Compile(`a=fmtp:` + opusNo + ` .+`)
+		if err != nil {
+			c.log.Errorf("client: error on compile regex ", err)
+			return sdp
+		}
+
+		fmtpLine := fmtpRegex.FindString(sdp.SDP)
+		if fmtpLine == "" {
+			c.log.Errorf("client: error fmtp line not found")
+			return sdp
+		}
+
+		var newFmtpLine = ""
+
+		if strings.Contains(fmtpLine, "usedtx=1") {
+			newFmtpLine += ";usedtx=0"
+		}
+
+		if strings.Contains(fmtpLine, "useinbandfec=1") {
+			newFmtpLine += ";useinbandfec=0"
+		}
+
+		if newFmtpLine != "" {
+			sdp.SDP = strings.Replace(sdp.SDP, fmtpLine, fmtpLine+newFmtpLine, -1)
+		}
+
 	}
 
 	if !c.dataChannelsInitiated {
