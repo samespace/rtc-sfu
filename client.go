@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/inlivedev/sfu/pkg/interceptors/playoutdelay"
 	"github.com/inlivedev/sfu/pkg/interceptors/voiceactivedetector"
 	"github.com/inlivedev/sfu/pkg/networkmonitor"
@@ -24,6 +25,7 @@ import (
 	"github.com/pion/logging"
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
+	"github.com/pion/webrtc/v4/pkg/media"
 )
 
 type ClientState int
@@ -193,6 +195,11 @@ type Client struct {
 	vadInterceptor                 *voiceactivedetector.Interceptor
 	vads                           map[uint32]*voiceactivedetector.VoiceDetector
 	log                            logging.LeveledLogger
+
+	// player
+	playerTrack *webrtc.TrackLocalStaticSample
+	isPlaying   *atomic.Bool
+	playerStop  chan bool
 }
 
 func DefaultClientOptions() ClientOptions {
@@ -326,6 +333,8 @@ func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Confi
 		panic(err)
 	}
 
+	playerTrack, _ := newPlayerTrack(peerConnection)
+
 	var stateNew atomic.Value
 	stateNew.Store(ClientStateNew)
 
@@ -364,6 +373,10 @@ func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Confi
 		vadInterceptor:                 vadInterceptor,
 		vads:                           vads,
 		log:                            opts.Log,
+
+		// player
+		playerTrack: playerTrack,
+		isPlaying:   &atomic.Bool{},
 	}
 
 	client.onTrack = func(track ITrack) {
@@ -640,7 +653,7 @@ func (c *Client) Context() context.Context {
 
 // OnTrackAdded event is to confirmed the source type of the pending published tracks.
 // If the event is not listened, the pending published tracks will be ignored and not published to other clients.
-// Once received, respond with `client.SetTracksSourceType()“ to confirm the source type of the pending published tracks
+// Once received, respond with `client.SetTracksSourceType()" to confirm the source type of the pending published tracks
 func (c *Client) OnTracksAdded(callback func(addedTracks []ITrack)) {
 	c.muCallback.Lock()
 	defer c.muCallback.Unlock()
@@ -843,6 +856,45 @@ func (c *Client) setOpusSDP(sdp webrtc.SessionDescription) webrtc.SessionDescrip
 		if newFmtpLine != "" {
 			sdp.SDP = strings.Replace(sdp.SDP, fmtpLine, fmtpLine+newFmtpLine, -1)
 		}
+	} else {
+		// remove the opus usedtx line
+		regex, err := regexp.Compile(`a=rtpmap:(\d+) opus\/(\d+)\/(\d+)`)
+		if err != nil {
+			c.log.Errorf("client: error on compile regex ", err)
+			return sdp
+		}
+		var opusLine = regex.FindString(sdp.SDP)
+		if opusLine == "" {
+			c.log.Errorf("client: error opus line not found")
+			return sdp
+		}
+
+		regex, err = regexp.Compile(`(\d+)`)
+		if err != nil {
+			c.log.Errorf("client: error on compile regex ", err)
+			return sdp
+		}
+
+		var opusNo = regex.FindString(opusLine)
+		if opusNo == "" {
+			c.log.Errorf("client: error opus no not found")
+			return sdp
+		}
+
+		fmtpRegex, err := regexp.Compile(`a=fmtp:` + opusNo + ` .+`)
+		if err != nil {
+			c.log.Errorf("client: error on compile regex ", err)
+			return sdp
+		}
+
+		fmtpLine := fmtpRegex.FindString(sdp.SDP)
+		if fmtpLine == "" {
+			c.log.Errorf("client: error fmtp line not found")
+			return sdp
+		}
+
+		var newFmtpLine = ";usedtx=0;useinbandfec=0"
+		sdp.SDP = strings.Replace(sdp.SDP, fmtpLine, fmtpLine+newFmtpLine, -1)
 	}
 
 	if !c.dataChannelsInitiated {
@@ -1014,7 +1066,8 @@ func (c *Client) setClientTrack(t ITrack) iClientTrack {
 		return nil
 	}
 
-	// TODO: change to non goroutine
+	// Store the sender for hold/unhold functionality
+	c.peerConnection.StoreSender(outputTrack.ID(), senderTcv.Sender(), localTrack)
 
 	outputTrack.OnEnded(func() {
 		if c == nil {
@@ -1171,6 +1224,9 @@ func (c *Client) afterClosed() {
 	c.sfu.onAfterClientStopped(c)
 
 	c.cancel()
+
+	// close player stop chan
+	c.StopPlay()
 }
 
 func (c *Client) stop() error {
@@ -1933,4 +1989,168 @@ func (c *Client) onNetworkConditionChanged(condition networkmonitor.NetworkCondi
 	if c.onNetworkConditionChangedFunc != nil {
 		c.onNetworkConditionChangedFunc(condition)
 	}
+}
+
+// Hold puts a specific track on hold by replacing it with a silence track.
+// This effectively mutes the track for the receiving peer.
+// The trackID should be the ID of the track to put on hold.
+func (c *Client) Hold(trackID string) error {
+	sender, exists := c.peerConnection.GetSender(trackID)
+	if !exists {
+		return ErrTrackIsNotExists
+	}
+
+	return c.peerConnection.Hold(trackID, sender)
+}
+
+// Unhold removes a track from hold by restoring the original track.
+// The trackID should be the ID of the track to remove from hold.
+func (c *Client) Unhold(trackID string) error {
+	return c.peerConnection.Unhold(trackID)
+}
+
+// IsTrackOnHold checks if a specific track is currently on hold.
+func (c *Client) IsTrackOnHold(trackID string) bool {
+	return c.peerConnection.IsOnHold(trackID)
+}
+
+// GetHeldTracks returns a list of track IDs that are currently on hold.
+func (c *Client) GetHeldTracks() []string {
+	return c.peerConnection.GetHeldTracks()
+}
+
+// HoldAllTracks puts all tracks from this client on hold.
+// This is useful for muting the entire client.
+func (c *Client) HoldAllTracks() error {
+	c.muTracks.Lock()
+	defer c.muTracks.Unlock()
+
+	var firstError error
+	for trackID := range c.clientTracks {
+		if err := c.Hold(trackID); err != nil && firstError == nil {
+			firstError = err
+		}
+	}
+	return firstError
+}
+
+// UnholdAllTracks removes all tracks from hold.
+// This is useful for unmuting the entire client.
+func (c *Client) UnholdAllTracks() error {
+	heldTracks := c.GetHeldTracks()
+	var firstError error
+	for _, trackID := range heldTracks {
+		if err := c.Unhold(trackID); err != nil && firstError == nil {
+			firstError = err
+		}
+	}
+	return firstError
+}
+
+// StopPlay stops any ongoing playback.
+func (c *Client) StopPlay() {
+	if c.isPlaying.Load() && c.playerStop != nil {
+		close(c.playerStop)
+	}
+}
+
+// Play streams OGG Opus audio from the given endpoint to this client. It blocks until playback is stopped or completes.
+func (c *Client) Play(ctx context.Context, endpoint, method, body string, loop bool) error {
+	if c.isPlaying.Load() {
+		return errors.New("already playing")
+	}
+
+	c.playerStop = make(chan bool)
+
+	playerTrack := c.playerTrack
+	if playerTrack == nil {
+		return errors.New("player track not found")
+	}
+	c.isPlaying.Store(true)
+
+	// Playback ticker
+	ticker := time.NewTicker(time.Millisecond * 20)
+	defer func() {
+		fmt.Println("client: stopping play")
+		c.playerStop = nil
+		c.isPlaying.Store(false)
+		ticker.Stop()
+	}()
+
+	// Fetch and read OGG packets
+	file, err := GetFile(endpoint, method, body)
+	if err != nil {
+		return err
+	}
+	oggReader, _, err := NewOggReader(file, loop)
+	if err != nil {
+		return err
+	}
+
+	for {
+		select {
+		case <-c.playerStop:
+			return nil
+
+		case <-ctx.Done():
+			return nil
+
+		case <-ticker.C:
+			packet, err := oggReader.ReadPacket()
+			if errors.Is(err, io.EOF) {
+				if loop {
+					file, err = GetFile(endpoint, method, body)
+					if err != nil {
+						return err
+					}
+					oggReader, _, err = NewOggReader(file, loop)
+					if err != nil {
+						return err
+					}
+					continue
+				}
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+
+			// Determine packet duration and write sample
+			dur, err := ParsePacketDuration(packet)
+			if err != nil {
+				return err
+			}
+			if err := playerTrack.WriteSample(media.Sample{Data: packet, Duration: dur}); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func newPlayerTrack(peerConnection *webrtc.PeerConnection) (*webrtc.TrackLocalStaticSample, error) {
+	trackID := fmt.Sprintf("player-track-%s", uuid.New().String())
+	streamID := fmt.Sprintf("player-stream-%s", uuid.New().String())
+	track, err := webrtc.NewTrackLocalStaticSample(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus},
+		trackID, streamID,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Add track to peer connection, will trigger renegotiation
+	_, err = peerConnection.AddTrack(track)
+	if err != nil {
+		fmt.Println("error adding player track", err)
+	}
+
+	// write silence to player track
+	go func() {
+		for i := 0; i < 50; i++ {
+			silenceSample := media.Sample{Data: OpusSilenceFrame, Duration: time.Millisecond * 20}
+			track.WriteSample(silenceSample)
+		}
+	}()
+
+	return track, nil
 }

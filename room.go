@@ -68,6 +68,10 @@ type Room struct {
 	extensions              []IExtension
 	OnEvent                 func(event Event)
 	options                 RoomOptions
+
+	// recording management
+	recordingSession *recordingSession
+	recordingMu      sync.Mutex
 }
 
 type RoomOptions struct {
