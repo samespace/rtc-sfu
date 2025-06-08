@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/rand/v2"
 	"os"
 	"os/exec"
@@ -587,13 +588,6 @@ func (r *Room) StopRecording() error {
 // mergeAndUpload mixes per-channel recordings, merges stereo, uploads to S3, and removes local files.
 func (r *Room) mergeAndUpload(session *recordingSession) error {
 	baseDir := filepath.Join(session.cfg.BasePath, session.id)
-
-	// Calculate exact recording duration
-	recordingDuration := session.meta.StopTime.Sub(session.meta.StartTime)
-	durationSeconds := fmt.Sprintf("%.3f", recordingDuration.Seconds())
-
-	fmt.Printf("Recording duration: %v (%s seconds)", recordingDuration, durationSeconds)
-
 	// Group track files by channel
 	filesByChannel := map[ChannelType][]string{}
 	for clientID, writerMap := range session.writers {
@@ -612,10 +606,18 @@ func (r *Room) mergeAndUpload(session *recordingSession) error {
 		monoPath := filepath.Join(baseDir, fmt.Sprintf("mono_%d.ogg", ch))
 		if len(inputs) == 1 {
 			src := inputs[0]
-			// Use ffmpeg to ensure exact duration even for single input
-			cmd := exec.Command("ffmpeg", "-y", "-i", src, "-c", "copy", "-t", durationSeconds, monoPath)
-			if out, err := cmd.CombinedOutput(); err != nil {
-				return fmt.Errorf("ffmpeg copy single input for channel %d failed: %v, output: %s", ch, err, string(out))
+			inF, err := os.Open(src)
+			if err != nil {
+				return fmt.Errorf("copy file for channel %d failed: %v", ch, err)
+			}
+			defer inF.Close()
+			outF, err := os.Create(monoPath)
+			if err != nil {
+				return fmt.Errorf("copy file for channel %d failed: %v", ch, err)
+			}
+			defer outF.Close()
+			if _, err := io.Copy(outF, inF); err != nil {
+				return fmt.Errorf("copy file for channel %d failed: %v", ch, err)
 			}
 			monoFiles[ch] = monoPath
 			continue
@@ -625,7 +627,7 @@ func (r *Room) mergeAndUpload(session *recordingSession) error {
 			args = append(args, "-i", in)
 		}
 		filter := fmt.Sprintf("amix=inputs=%d:duration=longest", len(inputs))
-		args = append(args, "-filter_complex", filter, "-ac", "1", "-t", durationSeconds, monoPath)
+		args = append(args, "-filter_complex", filter, "-ac", "1", monoPath)
 		cmd := exec.Command("ffmpeg", args...)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("ffmpeg mix channel %d failed: %v, output: %s", ch, err, string(out))
@@ -637,7 +639,7 @@ func (r *Room) mergeAndUpload(session *recordingSession) error {
 	left, hasLeft := monoFiles[ChannelOne]
 	right, hasRight := monoFiles[ChannelTwo]
 	if hasLeft && hasRight {
-		cmd := exec.Command("ffmpeg", "-y", "-i", left, "-i", right, "-filter_complex", "amerge=inputs=2", "-ac", "2", "-t", durationSeconds, finalPath)
+		cmd := exec.Command("ffmpeg", "-y", "-i", left, "-i", right, "-filter_complex", "amerge=inputs=2", "-ac", "2", finalPath)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("ffmpeg merge stereo failed: %v, output: %s", err, string(out))
 		}
@@ -646,17 +648,15 @@ func (r *Room) mergeAndUpload(session *recordingSession) error {
 		if !hasLeft {
 			src = right
 		}
-		// Use ffmpeg to ensure exact duration even for single channel
-		cmd := exec.Command("ffmpeg", "-y", "-i", src, "-c", "copy", "-t", durationSeconds, finalPath)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("ffmpeg copy with duration failed: %v, output: %s", err, string(out))
+		if err := os.Rename(src, finalPath); err != nil {
+			return err
 		}
 	} else {
 		return fmt.Errorf("no audio to merge")
 	}
 	// Convert merged .ogg to .m4a
 	m4aPath := filepath.Join(baseDir, session.id+".m4a")
-	cmd := exec.Command("ffmpeg", "-y", "-i", finalPath, "-c:a", "aac", "-b:a", "32k", "-t", durationSeconds, m4aPath)
+	cmd := exec.Command("ffmpeg", "-y", "-i", finalPath, "-c:a", "aac", "-b:a", "32k", m4aPath)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("ffmpeg convert to m4a failed: %v, output: %s", err, string(out))
 	}
