@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -58,13 +59,27 @@ type recordingSession struct {
 	}
 }
 
+// bufferedPacket holds an RTP packet along with its arrival time
+type bufferedPacket struct {
+	packet      *rtp.Packet
+	arrivalTime time.Time
+}
+
 type trackWriter struct {
-	writer           *oggwriter.OggWriter
-	lastPacketTime   time.Time
-	lastRTPTimestamp uint32
-	lastSeqNum       uint16
-	clockRate        uint32
-	mu               sync.Mutex
+	writer                       *oggwriter.OggWriter
+	lastRTPTimestamp             uint32
+	actualPacketLastRTPTimestamp uint32
+	lastSeqNum                   uint16
+	clockRate                    uint32
+	lastPacketTime               time.Time
+	mu                           sync.Mutex
+
+	// Buffering fields
+	packetBuffer chan bufferedPacket
+	stopChan     chan struct{}
+	wg           sync.WaitGroup
+	ssrc         uint32
+	firstPacket  bool
 }
 
 // StartRecording begins recording audio tracks in the room according to the provided config.
@@ -150,93 +165,39 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 		if err != nil {
 			return err
 		}
-		// Create trackWriter with proper clock rate
-		session.writers[clientID][track.ID()] = &trackWriter{
+
+		// Create trackWriter with buffering
+		tw := &trackWriter{
 			writer:           ow,
-			clockRate:        sampleRate, // 48000 for Opus
-			lastPacketTime:   time.Time{},
+			clockRate:        sampleRate,
 			lastRTPTimestamp: 0,
 			lastSeqNum:       0,
-			mu:               sync.Mutex{},
+			firstPacket:      true,
+			packetBuffer:     make(chan bufferedPacket, 1000), // Buffer up to 1000 packets
+			stopChan:         make(chan struct{}),
 		}
+
+		session.writers[clientID][track.ID()] = tw
+
+		// Start the packet processor goroutine
+		tw.wg.Add(1)
+		go tw.processPackets()
 
 		track.OnRead(func(attrs interceptor.Attributes, pkt *rtp.Packet, q QualityLevel) {
 			if session.paused || session.stopped {
 				return
 			}
 
-			tw := session.writers[clientID][track.ID()]
-			tw.mu.Lock()
-			defer tw.mu.Unlock()
-
-			fmt.Printf("writing packet for client %s, track %s: %v", clientID, track.ID(), pkt)
-
-			// // Current time when packet arrived
-			// currentPacketTime := time.Now()
-
-			// // Determine the reference time for gap detection
-			// timeToCompareWith := tw.lastPacketTime
-			// if timeToCompareWith.IsZero() {
-			// 	timeToCompareWith = session.meta.StartTime
-			// }
-
-			// // Initialize sequence number and timestamp for first packet
-			// if tw.lastSeqNum == 0 {
-			// 	tw.lastSeqNum = uint16(rand.IntN(1 << 16))
-			// 	tw.lastRTPTimestamp = rand.Uint32()
-			// }
-
-			// // Calculate samples per packet based on clock rate (usually 960 for 20ms at 48kHz)
-			samplesPerPacket := uint32(tw.clockRate * 20 / 1000) // 20ms worth of samples
-
-			// // Check for time gap (indicating mute period)
-			// timeDiff := currentPacketTime.Sub(timeToCompareWith)
-			// if timeDiff > 250*time.Millisecond {
-			// 	// Calculate number of packets needed to fill the gap
-			// 	numPackets := int(timeDiff / (20 * time.Millisecond))
-
-			// 	// Insert silence packets to fill the gap
-			// 	for i := 0; i < numPackets; i++ {
-			// 		tw.lastSeqNum++
-			// 		tw.lastRTPTimestamp += samplesPerPacket
-
-			// 		// Proper Opus silence frame (DTX - Discontinuous Transmission)
-			// 		opusSilence := []byte{0xF8, 0xFF, 0xFE} // Opus DTX frame
-
-			// 		silentPkt := &rtp.Packet{
-			// 			Header: rtp.Header{
-			// 				Version:        2,
-			// 				PayloadType:    111, // Opus payload type
-			// 				SequenceNumber: tw.lastSeqNum,
-			// 				Timestamp:      tw.lastRTPTimestamp,
-			// 				SSRC:           pkt.SSRC,
-			// 			},
-			// 			Payload: opusSilence,
-			// 		}
-
-			// 		if err := writeRTPWithSamples(tw.writer, silentPkt, uint64(samplesPerPacket)); err != nil {
-			// 			fmt.Printf("error writing silent packet: %v", err)
-			// 			return
-			// 		}
-			// 	}
-			// }
-
-			// // Process the actual packet
-			// tw.lastSeqNum++
-			// tw.lastRTPTimestamp += samplesPerPacket
-
-			// // Create a copy to avoid modifying the original packet
-			// actualPkt := *pkt
-			// actualPkt.SequenceNumber = tw.lastSeqNum
-			// actualPkt.Timestamp = tw.lastRTPTimestamp
-
-			if err := writeRTPWithSamples(tw.writer, pkt, uint64(samplesPerPacket)); err != nil {
-				fmt.Printf("error writing packet: %v", err)
-				return
+			// Buffer the packet with its arrival time
+			select {
+			case tw.packetBuffer <- bufferedPacket{
+				packet:      pkt.Clone(),
+				arrivalTime: time.Now(),
+			}:
+			default:
+				// Buffer full, drop packet
+				fmt.Printf("packet buffer full for client %s, track %s, dropping packet", clientID, track.ID())
 			}
-
-			// Update the last packet time for next gap detection
-			// tw.lastPacketTime = currentPacketTime
 		})
 
 		fmt.Printf("added writer for client %s, track %s", clientID, track.ID())
@@ -290,6 +251,151 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 	return id, nil
 }
 
+// processPackets processes buffered packets in a separate goroutine
+func (tw *trackWriter) processPackets() {
+	defer tw.wg.Done()
+
+	ticker := time.NewTicker(100 * time.Millisecond) // Process buffer every 100ms
+	defer ticker.Stop()
+
+	packetBatch := make([]bufferedPacket, 0, 100)
+
+	for {
+		select {
+		case <-tw.stopChan:
+			// Process any remaining packets
+			tw.drainBuffer(packetBatch)
+			return
+
+		case <-ticker.C:
+			// Collect packets from buffer
+			packetBatch = packetBatch[:0]
+		collectLoop:
+			for {
+				select {
+				case pkt := <-tw.packetBuffer:
+					packetBatch = append(packetBatch, pkt)
+					if len(packetBatch) >= 100 {
+						break collectLoop
+					}
+				default:
+					break collectLoop
+				}
+			}
+
+			// Process collected packets
+			if len(packetBatch) > 0 {
+				tw.processBatch(packetBatch)
+			}
+		}
+	}
+}
+
+// drainBuffer processes all remaining packets in the buffer
+func (tw *trackWriter) drainBuffer(batch []bufferedPacket) {
+	for {
+		select {
+		case pkt := <-tw.packetBuffer:
+			batch = append(batch, pkt)
+		default:
+			if len(batch) > 0 {
+				tw.processBatch(batch)
+			}
+			return
+		}
+	}
+}
+
+// processBatch processes a batch of packets
+func (tw *trackWriter) processBatch(batch []bufferedPacket) {
+	tw.mu.Lock()
+	defer tw.mu.Unlock()
+
+	for _, bp := range batch {
+		pkt := bp.packet
+
+		// Calculate samples per packet (20ms worth)
+		samplesPerPacket := uint32(tw.clockRate * 20 / 1000)
+
+		// Initialize on first packet
+		if tw.firstPacket {
+			tw.lastSeqNum = uint16(rand.IntN(1 << 16))
+			tw.lastRTPTimestamp = pkt.Timestamp
+			tw.actualPacketLastRTPTimestamp = pkt.Timestamp
+			tw.ssrc = pkt.SSRC
+			tw.firstPacket = false
+			tw.lastPacketTime = bp.arrivalTime
+
+			// Write the first packet
+			actualPkt := *pkt
+			actualPkt.SequenceNumber = tw.lastSeqNum
+			// Keep the original timestamp for the first packet
+
+			if err := writeRTPWithSamples(tw.writer, &actualPkt, uint64(samplesPerPacket)); err != nil {
+				fmt.Printf("error writing first packet: %v", err)
+			}
+
+			tw.lastSeqNum++
+			continue
+		}
+
+		// Detect unmute by checking if RTP timestamp hasn't advanced or has gone backwards
+		// This is the key indicator that the sender was muted
+		isUnmute := pkt.Timestamp <= tw.actualPacketLastRTPTimestamp
+
+		if isUnmute && !tw.lastPacketTime.IsZero() {
+			// Use wall-clock time to determine actual mute duration
+			muteDuration := bp.arrivalTime.Sub(tw.lastPacketTime)
+
+			// Only insert silence if the gap is significant (> 100ms)
+			// This avoids inserting silence for small processing delays
+			if muteDuration > 100*time.Millisecond {
+				// Calculate number of silent packets needed
+				numSilentPackets := int(muteDuration.Milliseconds() / 20)
+
+				// Insert silence packets
+				for i := 0; i < numSilentPackets; i++ {
+					tw.lastSeqNum++
+					tw.lastRTPTimestamp += samplesPerPacket
+
+					opusSilence := []byte{0xF8, 0xFF, 0xFE} // Opus DTX frame
+					silentPkt := &rtp.Packet{
+						Header: rtp.Header{
+							Version:        2,
+							PayloadType:    111,
+							SequenceNumber: tw.lastSeqNum,
+							Timestamp:      tw.lastRTPTimestamp,
+							SSRC:           tw.ssrc,
+						},
+						Payload: opusSilence,
+					}
+
+					if err := writeRTPWithSamples(tw.writer, silentPkt, uint64(samplesPerPacket)); err != nil {
+						fmt.Printf("error writing silent packet: %v", err)
+						continue
+					}
+				}
+			}
+		}
+
+		// Write the actual packet
+		tw.lastSeqNum++
+		tw.lastRTPTimestamp += samplesPerPacket
+
+		actualPkt := *pkt
+		actualPkt.SequenceNumber = tw.lastSeqNum
+		actualPkt.Timestamp = tw.lastRTPTimestamp
+
+		if err := writeRTPWithSamples(tw.writer, &actualPkt, uint64(samplesPerPacket)); err != nil {
+			fmt.Printf("error writing packet: %v", err)
+		}
+
+		// Update tracking variables
+		tw.actualPacketLastRTPTimestamp = pkt.Timestamp
+		tw.lastPacketTime = bp.arrivalTime
+	}
+}
+
 // PauseRecording pauses writing RTP packets to files.
 func (r *Room) PauseRecording() error {
 	r.recordingMu.Lock()
@@ -334,57 +440,21 @@ func (r *Room) StopRecording() error {
 	session.stopped = true
 	session.mu.Unlock()
 
-	// Fill any gaps from client disconnections during mute to session end
-	// session.mu.Lock()
-	// for clientID, writerMap := range session.writers {
-	// 	for trackID, tw := range writerMap {
-	// 		tw.mu.Lock()
+	// Stop all packet processors and wait for them to finish
+	session.mu.Lock()
+	for _, writerMap := range session.writers {
+		for _, tw := range writerMap {
+			close(tw.stopChan)
+		}
+	}
 
-	// 		// Check if there's a gap between last packet and session end
-	// 		timeToCompareWith := tw.lastPacketTime
-	// 		if timeToCompareWith.IsZero() {
-	// 			timeToCompareWith = session.meta.StartTime
-	// 		}
-
-	// 		timeDiff := session.meta.StopTime.Sub(timeToCompareWith)
-	// 		if timeDiff > 250*time.Millisecond {
-	// 			// Calculate number of 20ms packets needed to fill the gap to session end
-	// 			numPackets := int(timeDiff / (20 * time.Millisecond))
-
-	// 			// Calculate samples per packet based on clock rate
-	// 			samplesPerPacket := uint32(tw.clockRate * 20 / 1000) // 20ms worth of samples
-
-	// 			// Insert silence packets to fill the gap to session end
-	// 			for i := 0; i < numPackets; i++ {
-	// 				tw.lastSeqNum++
-	// 				tw.lastRTPTimestamp += samplesPerPacket
-
-	// 				// Proper Opus silence frame (DTX - Discontinuous Transmission)
-	// 				opusSilence := []byte{0xF8, 0xFF, 0xFE} // Opus DTX frame
-
-	// 				silentPkt := &rtp.Packet{
-	// 					Header: rtp.Header{
-	// 						Version:        2,
-	// 						PayloadType:    111, // Opus payload type
-	// 						SequenceNumber: tw.lastSeqNum,
-	// 						Timestamp:      tw.lastRTPTimestamp,
-	// 						SSRC:           0, // Use 0 since we don't have original SSRC
-	// 					},
-	// 					Payload: opusSilence,
-	// 				}
-
-	// 				if err := writeRTPWithSamples(tw.writer, silentPkt, uint64(samplesPerPacket)); err != nil {
-	// 					fmt.Printf("error writing final silent packet for client %s track %s: %v", clientID, trackID, err)
-	// 					// Continue processing other tracks even if one fails
-	// 					break
-	// 				}
-	// 			}
-	// 		}
-
-	// 		tw.mu.Unlock()
-	// 	}
-	// }
-	// session.mu.Unlock()
+	// Wait for all processors to finish
+	for _, writerMap := range session.writers {
+		for _, tw := range writerMap {
+			tw.wg.Wait()
+		}
+	}
+	session.mu.Unlock()
 
 	fmt.Printf("closing writers: %s", session.id)
 
