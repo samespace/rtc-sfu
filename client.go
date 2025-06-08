@@ -2087,6 +2087,9 @@ func (c *Client) Play(ctx context.Context, endpoint, method, body string, loop b
 		case <-c.playerStop:
 			return nil
 
+		case <-ctx.Done():
+			return nil
+
 		case <-ticker.C:
 			packet, err := oggReader.ReadPacket()
 			if errors.Is(err, io.EOF) {
