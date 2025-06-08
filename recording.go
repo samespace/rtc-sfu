@@ -429,12 +429,6 @@ func (tw *trackWriter) processBatch(batch []bufferedPacket) {
 		actualPkt.SequenceNumber = tw.lastSeqNum
 		actualPkt.Timestamp = tw.lastRTPTimestamp
 
-		// skip if payload is less than 3 bytes
-		if len(actualPkt.Payload) <= 1 {
-			// opus silence packet
-			actualPkt.Payload = []byte{0xF8, 0xFF, 0xFE}
-		}
-
 		if err := writeRTPWithSamples(tw.writer, &actualPkt, uint64(samplesPerPacket)); err != nil {
 			fmt.Printf("error writing packet: %v", err)
 		}
