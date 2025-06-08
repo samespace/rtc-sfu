@@ -509,15 +509,37 @@ func (s *SFU) HoldAllTracksFromClient(sourceClientID, targetClientID string) err
 		return err
 	}
 
+	// Get the source client to verify it exists
+	_, err = s.GetClient(sourceClientID)
+	if err != nil {
+		return err
+	}
+
 	// Find all tracks from the source client in the target client's subscriptions
 	targetTracks := targetClient.ClientTracks()
 	var firstError error
+	var heldCount int
+
 	for _, track := range targetTracks {
-		// For this implementation, we'll hold all tracks as we can't easily determine
-		// which tracks came from which source client without additional metadata
-		if err := targetClient.Hold(track.ID()); err != nil && firstError == nil {
-			firstError = err
+		// Get the track from published tracks to check its source
+		publishedTrack, err := targetClient.publishedTracks.Get(track.ID())
+		if err != nil {
+			continue
 		}
+
+		// Only hold tracks that come from the source client
+		if publishedTrack.ClientID() == sourceClientID {
+			if err := targetClient.Hold(track.ID()); err != nil && firstError == nil {
+				firstError = err
+			} else if err == nil {
+				heldCount++
+			}
+		}
+	}
+
+	// If no tracks were held, it might mean the target isn't subscribed to any tracks from source
+	if heldCount == 0 && firstError == nil {
+		s.log.Debugf("sfu: no tracks from client %s found in target client %s subscriptions", sourceClientID, targetClientID)
 	}
 
 	return firstError
@@ -532,7 +554,33 @@ func (s *SFU) UnholdAllTracksFromClient(sourceClientID, targetClientID string) e
 		return err
 	}
 
-	return targetClient.UnholdAllTracks()
+	// Get held tracks and filter by source client
+	heldTracks := targetClient.GetHeldTracks()
+	var firstError error
+	var unheldCount int
+
+	for _, trackID := range heldTracks {
+		// Get the track from published tracks to check its source
+		publishedTrack, err := targetClient.publishedTracks.Get(trackID)
+		if err != nil {
+			continue
+		}
+
+		// Only unhold tracks that come from the source client
+		if publishedTrack.ClientID() == sourceClientID {
+			if err := targetClient.Unhold(trackID); err != nil && firstError == nil {
+				firstError = err
+			} else if err == nil {
+				unheldCount++
+			}
+		}
+	}
+
+	if unheldCount == 0 && firstError == nil {
+		s.log.Debugf("sfu: no held tracks from client %s found for target client %s", sourceClientID, targetClientID)
+	}
+
+	return firstError
 }
 
 // IsClientTrackOnHold checks if a specific track from a source client is on hold for a target client.
