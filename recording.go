@@ -22,6 +22,10 @@ import (
 	"github.com/pion/webrtc/v4/pkg/media/oggwriter"
 )
 
+const (
+	silencePacketDetectionThreshold = 500 * time.Millisecond
+)
+
 type ChannelType int
 
 const (
@@ -333,7 +337,7 @@ func (tw *trackWriter) processBatch(batch []bufferedPacket) {
 				startGap := bp.arrivalTime.Sub(recordingStartTime)
 
 				// If the first packet arrives significantly after recording started
-				if startGap > 100*time.Millisecond {
+				if startGap > silencePacketDetectionThreshold {
 					numSilentPackets := int(startGap.Milliseconds() / 20)
 
 					fmt.Printf("Client started muted - filling %d silence packets at start (gap: %v)\n",
@@ -382,17 +386,13 @@ func (tw *trackWriter) processBatch(batch []bufferedPacket) {
 			continue
 		}
 
-		// Detect unmute by checking if RTP timestamp hasn't advanced or has gone backwards
-		// This is the key indicator that the sender was muted
-		isUnmute := pkt.Timestamp <= tw.actualPacketLastRTPTimestamp
-
-		if isUnmute && !tw.lastPacketTime.IsZero() {
+		if !tw.lastPacketTime.IsZero() {
 			// Use wall-clock time to determine actual mute duration
 			muteDuration := bp.arrivalTime.Sub(tw.lastPacketTime)
 
 			// Only insert silence if the gap is significant (> 100ms)
 			// This avoids inserting silence for small processing delays
-			if muteDuration > 100*time.Millisecond {
+			if muteDuration > silencePacketDetectionThreshold {
 				// Calculate number of silent packets needed
 				numSilentPackets := int(muteDuration.Milliseconds() / 20)
 
@@ -508,7 +508,7 @@ func (r *Room) StopRecording() error {
 				gapDuration := session.meta.StopTime.Sub(tw.lastPacketTime)
 
 				// If gap is significant (> 100ms), fill with silence
-				if gapDuration > 100*time.Millisecond {
+				if gapDuration > silencePacketDetectionThreshold {
 					samplesPerPacket := uint32(tw.clockRate * 20 / 1000)
 					numSilentPackets := int(gapDuration.Milliseconds() / 20)
 
