@@ -18,6 +18,7 @@ import (
 	"github.com/inlivedev/sfu/pkg/networkmonitor"
 	"github.com/pion/interceptor"
 	"github.com/pion/interceptor/pkg/cc"
+	"github.com/pion/interceptor/pkg/flexfec"
 	"github.com/pion/interceptor/pkg/gcc"
 	"github.com/pion/interceptor/pkg/nack"
 	"github.com/pion/interceptor/pkg/stats"
@@ -74,6 +75,7 @@ type ClientOptions struct {
 	EnableVoiceDetection bool          `json:"enable_voice_detection"`
 	EnablePlayoutDelay   bool          `json:"enable_playout_delay"`
 	EnableOpusDTX        bool          `json:"enable_opus_dtx"`
+	EnableFlexFEC        bool          `json:"enable_flexfec"`
 	EnableOpusInbandFEC  bool          `json:"enable_opus_inband_fec"`
 	// Configure the minimum playout delay that will be used by the client
 	// Recommendation:
@@ -209,8 +211,8 @@ func DefaultClientOptions() ClientOptions {
 		EnablePlayoutDelay:   true,
 		EnableOpusDTX:        true,
 		EnableOpusInbandFEC:  true,
-		MinPlayoutDelay:      100,
-		MaxPlayoutDelay:      200,
+		MinPlayoutDelay:      150,
+		MaxPlayoutDelay:      300,
 		JitterBufferMinWait:  20 * time.Millisecond,
 		JitterBufferMaxWait:  150 * time.Millisecond,
 		ReorderPackets:       false,
@@ -273,6 +275,15 @@ func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Confi
 		i.Add(vadInterceptorFactory)
 	}
 
+	if opts.EnableFlexFEC {
+		flexfecInterceptor, err := flexfec.NewFecInterceptor()
+		if err != nil {
+			panic(err)
+		}
+
+		i.Add(flexfecInterceptor)
+	}
+
 	estimatorChan := make(chan cc.BandwidthEstimator, 1)
 
 	// Create a Congestion Controller. This analyzes inbound and outbound data and provides
@@ -287,6 +298,7 @@ func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Confi
 			gcc.SendSideBWEInitialBitrate(int(s.bitrateConfigs.InitialBandwidth)),
 			// gcc.SendSideBWEPacer(pacer.NewLeakyBucketPacer(opts.Log, int(s.bitrateConfigs.InitialBandwidth), true)),
 			gcc.SendSideBWEPacer(gcc.NewNoOpPacer()),
+			// gcc.SendSideBWEPacer(gcc.NewLeakyBucketPacer(int(s.bitrateConfigs.InitialBandwidth))),
 		)
 	})
 	if err != nil {
@@ -373,17 +385,6 @@ func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Confi
 			// not an error could be because a simulcast track already added
 			return
 		}
-
-		// don't publish track when not all the tracks are received
-		// TODO:
-		// 1. need to handle simulcast track because  it will be counted as single track
-		initialReceiverCount := client.initialReceiverCount.Load()
-		if client.Type() == ClientTypePeer && int(initialReceiverCount) > client.pendingPublishedTracks.Length() {
-			s.log.Infof("sfu: client %s pending published tracks: %d, initial tracks count: %d", id, client.pendingPublishedTracks.Length(), initialReceiverCount)
-			return
-		}
-
-		s.log.Infof("sfu: client %s publish tracks, initial tracks count: %d, pending published tracks: %d", id, initialReceiverCount, client.pendingPublishedTracks.Length())
 
 		addedTracks := client.pendingPublishedTracks.GetTracks()
 
@@ -1255,6 +1256,10 @@ func (c *Client) End() error {
 }
 
 func (c *Client) AddICECandidate(candidate webrtc.ICECandidateInit) error {
+	if c.peerConnection == nil || c.peerConnection.PC() == nil {
+		return errors.New("client: peer connection is not initialized, make sure to call this after first negotiation done")
+	}
+
 	if c.peerConnection.PC().RemoteDescription() == nil {
 		c.pendingRemoteCandidates = append(c.pendingRemoteCandidates, candidate)
 	} else {
@@ -1291,7 +1296,7 @@ func (c *Client) sendPendingLocalCandidates() {
 		c.onIceCandidateCallback(candidate)
 	}
 
-	c.pendingLocalCandidates = nil
+	c.pendingLocalCandidates = c.pendingLocalCandidates[:0]
 }
 
 // OnConnectionStateChanged event is called when the SFU connection state is changed.

@@ -31,6 +31,10 @@ func (r *RTPPool) PutPacket(p *rtp.Packet) {
 	r.pool.Put(p)
 }
 
+// CopyPacket creates a copy of the RTP packet using the pool.
+// The returned packet MUST be returned to the pool via PutPacket when done.
+// WARNING: Do not use the returned packet across goroutine boundaries without additional synchronization.
+// WARNING: Do not hold references to the packet after calling PutPacket.
 func (r *RTPPool) CopyPacket(p *rtp.Packet) *rtp.Packet {
 	newPacket := r.GetPacket()
 	*newPacket = *p
@@ -68,7 +72,8 @@ func NewBufferPool() *BufferPool {
 	return &BufferPool{
 		pool: &sync.Pool{
 			New: func() interface{} {
-				buf := make([]byte, 0)
+				// Initialize with a reasonable default capacity, e.g., 1500 bytes
+				buf := make([]byte, 0, 1500)
 				return &buf
 			},
 		},
