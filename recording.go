@@ -194,16 +194,20 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 				return
 			}
 
-			// Buffer the packet with its arrival time
-			select {
-			case tw.packetBuffer <- bufferedPacket{
-				packet:      pkt.Clone(),
-				arrivalTime: time.Now(),
-			}:
-			default:
-				// Buffer full, drop packet
-				fmt.Printf("packet buffer full for client %s, track %s, dropping packet", clientID, track.ID())
+			if err := writeRTPWithSamples(tw.writer, pkt, uint64(tw.clockRate*20/1000)); err != nil {
+				fmt.Printf("error writing packet: %v", err)
 			}
+
+			// Buffer the packet with its arrival time
+			// select {
+			// case tw.packetBuffer <- bufferedPacket{
+			// 	packet:      pkt.Clone(),
+			// 	arrivalTime: time.Now(),
+			// }:
+			// default:
+			// 	// Buffer full, drop packet
+			// 	fmt.Printf("packet buffer full for client %s, track %s, dropping packet", clientID, track.ID())
+			// }
 		})
 
 		fmt.Printf("added writer for client %s, track %s", clientID, track.ID())
