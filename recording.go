@@ -687,7 +687,7 @@ func (r *Room) mergeAndUpload(session *recordingSession) error {
 	fmt.Printf("uploaded to s3: %s", object)
 	fmt.Printf("removing local files: %s", baseDir)
 	// Cleanup local files
-	os.RemoveAll(baseDir)
+	// os.RemoveAll(baseDir)
 	return nil
 }
 
