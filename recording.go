@@ -130,17 +130,22 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 	// Helper to add a track writer for a given client and track
 	addWriter := func(clientID string, track ITrack) error {
 
-		fmt.Printf("adding writer for client %s, track %s", clientID, track.ID())
-
 		session.mu.Lock()
 		defer session.mu.Unlock()
 		channel := cfg.ChannelMapping[clientID]
 		if channel == ChannelUnknown {
 			return nil
 		}
+
+		fmt.Printf("adding writer for client %s, track %s", clientID, track.ID())
+
 		if _, ok := session.writers[clientID]; !ok {
 			session.writers[clientID] = make(map[string]*trackWriter)
+		} else {
+			fmt.Printf("writer already exists for client %s, track %s", clientID, track.ID())
+			return nil
 		}
+
 		trackDir := filepath.Join(baseDir, clientID)
 		if err := os.MkdirAll(trackDir, 0755); err != nil {
 			return err
