@@ -129,6 +129,7 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 
 	// Helper to add a track writer for a given client and track
 	addWriter := func(clientID string, track ITrack) error {
+
 		session.mu.Lock()
 		defer session.mu.Unlock()
 		channel := cfg.ChannelMapping[clientID]
@@ -136,14 +137,14 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 			return nil
 		}
 
+		fmt.Printf("adding writer for client %s, track %s", clientID, track.ID())
+
 		if _, ok := session.writers[clientID]; !ok {
 			session.writers[clientID] = make(map[string]*trackWriter)
 		} else {
 			fmt.Printf("writer already exists for client %s, track %s", clientID, track.ID())
 			return nil
 		}
-
-		fmt.Printf("adding writer for client %s, track %s", clientID, track.ID())
 
 		trackDir := filepath.Join(baseDir, clientID)
 		if err := os.MkdirAll(trackDir, 0755); err != nil {
@@ -329,9 +330,6 @@ func (tw *trackWriter) processBatch(batch []bufferedPacket) {
 
 		// Initialize on first packet
 		if tw.firstPacket {
-
-			fmt.Println("first packet for client")
-
 			tw.lastSeqNum = uint16(rand.IntN(1 << 16))
 			tw.lastRTPTimestamp = pkt.Timestamp
 			tw.actualPacketLastRTPTimestamp = pkt.Timestamp
@@ -692,7 +690,7 @@ func (r *Room) mergeAndUpload(session *recordingSession) error {
 	fmt.Printf("uploaded to s3: %s", object)
 	fmt.Printf("removing local files: %s", baseDir)
 	// Cleanup local files
-	// os.RemoveAll(baseDir)
+	os.RemoveAll(baseDir)
 	return nil
 }
 
