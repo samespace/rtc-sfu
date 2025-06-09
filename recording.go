@@ -129,18 +129,22 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 
 	// Helper to add a track writer for a given client and track
 	addWriter := func(clientID string, track ITrack) error {
-
-		fmt.Printf("adding writer for client %s, track %s", clientID, track.ID())
-
 		session.mu.Lock()
 		defer session.mu.Unlock()
 		channel := cfg.ChannelMapping[clientID]
 		if channel == ChannelUnknown {
 			return nil
 		}
+
 		if _, ok := session.writers[clientID]; !ok {
 			session.writers[clientID] = make(map[string]*trackWriter)
+		} else {
+			fmt.Printf("writer already exists for client %s, track %s", clientID, track.ID())
+			return nil
 		}
+
+		fmt.Printf("adding writer for client %s, track %s", clientID, track.ID())
+
 		trackDir := filepath.Join(baseDir, clientID)
 		if err := os.MkdirAll(trackDir, 0755); err != nil {
 			return err
@@ -194,20 +198,16 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 				return
 			}
 
-			if err := writeRTPWithSamples(tw.writer, pkt, uint64(tw.clockRate*20/1000)); err != nil {
-				fmt.Printf("error writing packet: %v", err)
-			}
-
 			// Buffer the packet with its arrival time
-			// select {
-			// case tw.packetBuffer <- bufferedPacket{
-			// 	packet:      pkt.Clone(),
-			// 	arrivalTime: time.Now(),
-			// }:
-			// default:
-			// 	// Buffer full, drop packet
-			// 	fmt.Printf("packet buffer full for client %s, track %s, dropping packet", clientID, track.ID())
-			// }
+			select {
+			case tw.packetBuffer <- bufferedPacket{
+				packet:      pkt.Clone(),
+				arrivalTime: time.Now(),
+			}:
+			default:
+				// Buffer full, drop packet
+				fmt.Printf("packet buffer full for client %s, track %s, dropping packet", clientID, track.ID())
+			}
 		})
 
 		fmt.Printf("added writer for client %s, track %s", clientID, track.ID())
@@ -329,6 +329,9 @@ func (tw *trackWriter) processBatch(batch []bufferedPacket) {
 
 		// Initialize on first packet
 		if tw.firstPacket {
+
+			fmt.Println("first packet for client")
+
 			tw.lastSeqNum = uint16(rand.IntN(1 << 16))
 			tw.lastRTPTimestamp = pkt.Timestamp
 			tw.actualPacketLastRTPTimestamp = pkt.Timestamp
@@ -432,8 +435,6 @@ func (tw *trackWriter) processBatch(batch []bufferedPacket) {
 		actualPkt := *pkt
 		actualPkt.SequenceNumber = tw.lastSeqNum
 		actualPkt.Timestamp = tw.lastRTPTimestamp
-
-		fmt.Printf("writing rtp packet: %v", actualPkt)
 
 		if err := writeRTPWithSamples(tw.writer, &actualPkt, uint64(samplesPerPacket)); err != nil {
 			fmt.Printf("error writing packet: %v", err)
