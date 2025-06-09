@@ -194,6 +194,8 @@ func (r *Room) StartRecording(cfg RecordingConfig) (string, error) {
 				return
 			}
 
+			fmt.Printf("received packet for client %s, track %s, pkt: %v", clientID, track.ID(), pkt)
+
 			// Buffer the packet with its arrival time
 			select {
 			case tw.packetBuffer <- bufferedPacket{
