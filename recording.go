@@ -474,8 +474,7 @@ func (r *Room) ResumeRecording() error {
 
 // StopRecording stops the recording session, closes files, and writes metadata.
 func (r *Room) StopRecording() error {
-
-	fmt.Printf("stopping recording: %s", r.recordingSession.id)
+	fmt.Printf("stopping recording: %v", r.recordingSession)
 
 	r.recordingMu.Lock()
 	session := r.recordingSession
